@@ -659,9 +659,18 @@ class HistoriqueProxy(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.filter_marche = ""
+        # Filtres par plage de dates
+        self.filter_date_from = None  # date ou None
+        self.filter_date_to = None    # date ou None
 
     def setMarcheFilter(self, text):
         self.filter_marche = text or ""
+        self.invalidateFilter()
+
+    def setDateFilter(self, date_from, date_to):
+        """Filtre par plage de dates (date_sf). date_from/date_to: date ou None."""
+        self.filter_date_from = date_from
+        self.filter_date_to = date_to
         self.invalidateFilter()
 
     def filterAcceptsRow(self, source_row, source_parent):
@@ -676,6 +685,30 @@ class HistoriqueProxy(QSortFilterProxyModel):
             marche = str(row.get("marche", "")).lower()
             if self.filter_marche.lower() not in marche:
                 return False
+
+        # Filtre par plage de dates (date_sf au format dd/mm/yyyy)
+        if self.filter_date_from or self.filter_date_to:
+            date_str = row.get("date_sf", "") or ""
+            if date_str:
+                try:
+                    # Essayer dd/mm/yyyy puis yyyy-mm-dd
+                    row_date = None
+                    for fmt in ("%d/%m/%Y", "%Y-%m-%d"):
+                        try:
+                            row_date = datetime.strptime(date_str[:10], fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                    if row_date:
+                        if self.filter_date_from and row_date < self.filter_date_from:
+                            return False
+                        if self.filter_date_to and row_date > self.filter_date_to:
+                            return False
+                except (ValueError, TypeError):
+                    pass
+            else:
+                if self.filter_date_from or self.filter_date_to:
+                    return False
 
         return True
 

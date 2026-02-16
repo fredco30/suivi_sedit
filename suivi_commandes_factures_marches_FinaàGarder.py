@@ -23,6 +23,7 @@ from PyQt5.QtCore import (
     QSortFilterProxyModel,
     QTimer,
     QTime,
+    QDate,
     QEvent,
 )
 from PyQt5.QtGui import QIcon, QBrush, QColor, QFont, QStandardItemModel, QStandardItem
@@ -54,7 +55,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QVBoxLayout,
     QLineEdit,
-    QCheckBox,    QTimeEdit,
+    QCheckBox,    QTimeEdit,    QDateEdit,
  )
 
 
@@ -1536,6 +1537,15 @@ class CommandesProxy(QSortFilterProxyModel):
         self.filter_service_emetteur = []
         # Filtre de recherche par N° de commande
         self.filter_num_commande = ""
+        # Filtres par plage de dates
+        self.filter_date_from = None  # date ou None
+        self.filter_date_to = None    # date ou None
+
+    def setDateFilter(self, date_from, date_to):
+        """Filtre par plage de dates (date_commande). date_from/date_to: date ou None."""
+        self.filter_date_from = date_from
+        self.filter_date_to = date_to
+        self.invalidateFilter()
 
     def setStatusFilter(self, status):
         self.filter_status = status
@@ -1649,6 +1659,23 @@ class CommandesProxy(QSortFilterProxyModel):
             if self.filter_num_commande.lower() not in num_commande.lower():
                 return False
 
+        # Filtre par plage de dates (date_commande)
+        if self.filter_date_from or self.filter_date_to:
+            date_str = row["date_commande"] or ""
+            if date_str:
+                try:
+                    row_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+                    if self.filter_date_from and row_date < self.filter_date_from:
+                        return False
+                    if self.filter_date_to and row_date > self.filter_date_to:
+                        return False
+                except (ValueError, TypeError):
+                    pass
+            else:
+                # Pas de date => exclure si un filtre date est actif
+                if self.filter_date_from or self.filter_date_to:
+                    return False
+
         return True
 
 
@@ -1747,6 +1774,15 @@ class FacturesProxy(QSortFilterProxyModel):
         # Filtres de recherche
         self.filter_num_commande = ""
         self.filter_num_facture = ""
+        # Filtres par plage de dates
+        self.filter_date_from = None
+        self.filter_date_to = None
+
+    def setDateFilter(self, date_from, date_to):
+        """Filtre par plage de dates (date_facture). date_from/date_to: date ou None."""
+        self.filter_date_from = date_from
+        self.filter_date_to = date_to
+        self.invalidateFilter()
 
     def setStatutFilter(self, text):
         self.filter_statut = text or "Tous"
@@ -1840,6 +1876,22 @@ class FacturesProxy(QSortFilterProxyModel):
             if self.filter_num_facture.lower() not in num_facture.lower():
                 return False
 
+        # Filtre par plage de dates (date_facture)
+        if self.filter_date_from or self.filter_date_to:
+            date_str = row["date_facture"] or ""
+            if date_str:
+                try:
+                    row_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+                    if self.filter_date_from and row_date < self.filter_date_from:
+                        return False
+                    if self.filter_date_to and row_date > self.filter_date_to:
+                        return False
+                except (ValueError, TypeError):
+                    pass
+            else:
+                if self.filter_date_from or self.filter_date_to:
+                    return False
+
         return True
 
 
@@ -1929,6 +1981,15 @@ class FacturationProxy(QSortFilterProxyModel):
         self.filter_statut = "Tous"
         self.filter_fournisseur = ""
         self.filter_marche = "Tous"
+        # Filtres par plage de dates
+        self.filter_date_from = None
+        self.filter_date_to = None
+
+    def setDateFilter(self, date_from, date_to):
+        """Filtre par plage de dates (derniere_facture). date_from/date_to: date ou None."""
+        self.filter_date_from = date_from
+        self.filter_date_to = date_to
+        self.invalidateFilter()
 
     def setStatutFilter(self, text):
         self.filter_statut = text or "Tous"
@@ -1991,6 +2052,22 @@ class FacturationProxy(QSortFilterProxyModel):
             marche = row["marche"] or ""
             if self.filter_marche != marche:
                 return False
+
+        # Filtre par plage de dates (derniere_facture)
+        if self.filter_date_from or self.filter_date_to:
+            date_str = row["derniere_facture"] or ""
+            if date_str:
+                try:
+                    row_date = datetime.strptime(date_str[:10], "%Y-%m-%d").date()
+                    if self.filter_date_from and row_date < self.filter_date_from:
+                        return False
+                    if self.filter_date_to and row_date > self.filter_date_to:
+                        return False
+                except (ValueError, TypeError):
+                    pass
+            else:
+                if self.filter_date_from or self.filter_date_to:
+                    return False
 
         return True
 
@@ -2689,6 +2766,35 @@ class MainWindow(QMainWindow):
             lambda text: self.historique_proxy.setMarcheFilter(text)
         )
         filtre_historique_layout.addWidget(self.edit_filtre_historique)
+
+        # Filtres par date pour l'historique
+        filtre_historique_layout.addWidget(QLabel("  Du:"))
+        self.date_filter_hist_from = QDateEdit()
+        self.date_filter_hist_from.setCalendarPopup(True)
+        self.date_filter_hist_from.setDisplayFormat("dd/MM/yyyy")
+        self.date_filter_hist_from.setSpecialValueText(" ")
+        self.date_filter_hist_from.setMinimumDate(QDate(2000, 1, 1))
+        self.date_filter_hist_from.setDate(QDate(2000, 1, 1))
+        self.date_filter_hist_from.setMaximumWidth(130)
+        self.date_filter_hist_from.dateChanged.connect(self._on_hist_date_changed)
+        filtre_historique_layout.addWidget(self.date_filter_hist_from)
+
+        filtre_historique_layout.addWidget(QLabel("  Au:"))
+        self.date_filter_hist_to = QDateEdit()
+        self.date_filter_hist_to.setCalendarPopup(True)
+        self.date_filter_hist_to.setDisplayFormat("dd/MM/yyyy")
+        self.date_filter_hist_to.setSpecialValueText(" ")
+        self.date_filter_hist_to.setMinimumDate(QDate(2000, 1, 1))
+        self.date_filter_hist_to.setDate(QDate(2000, 1, 1))
+        self.date_filter_hist_to.setMaximumWidth(130)
+        self.date_filter_hist_to.dateChanged.connect(self._on_hist_date_changed)
+        filtre_historique_layout.addWidget(self.date_filter_hist_to)
+
+        btn_clear_hist_dates = QPushButton("Effacer dates")
+        btn_clear_hist_dates.setMaximumWidth(100)
+        btn_clear_hist_dates.clicked.connect(self._on_clear_hist_dates)
+        filtre_historique_layout.addWidget(btn_clear_hist_dates)
+
         filtre_historique_layout.addStretch()
 
         historique_layout.addWidget(filtre_historique_widget)
@@ -3204,6 +3310,43 @@ class MainWindow(QMainWindow):
         self.search_num_facture.textChanged.connect(self.on_search_num_facture_changed)
         tb3.addWidget(self.search_num_facture)
 
+        # ========== FILTRES PAR DATE (Du / Au) ==========
+        self.sep_date = QLabel("||", self)
+        self.sep_date.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
+        tb3.addWidget(self.sep_date)
+
+        self.label_date_du = QLabel("<b>Du:</b>", self)
+        tb3.addWidget(self.label_date_du)
+
+        self.date_filter_from = QDateEdit(self)
+        self.date_filter_from.setCalendarPopup(True)
+        self.date_filter_from.setDisplayFormat("dd/MM/yyyy")
+        self.date_filter_from.setSpecialValueText(" ")  # texte affiché quand valeur = minimum
+        self.date_filter_from.setMinimumDate(QDate(2000, 1, 1))
+        self.date_filter_from.setDate(QDate(2000, 1, 1))  # valeur min = pas de filtre
+        self.date_filter_from.setMaximumWidth(130)
+        self.date_filter_from.dateChanged.connect(self.on_date_filter_changed)
+        tb3.addWidget(self.date_filter_from)
+
+        self.label_date_au = QLabel("<b>Au:</b>", self)
+        tb3.addWidget(self.label_date_au)
+
+        self.date_filter_to = QDateEdit(self)
+        self.date_filter_to.setCalendarPopup(True)
+        self.date_filter_to.setDisplayFormat("dd/MM/yyyy")
+        self.date_filter_to.setSpecialValueText(" ")
+        self.date_filter_to.setMinimumDate(QDate(2000, 1, 1))
+        self.date_filter_to.setDate(QDate(2000, 1, 1))  # valeur min = pas de filtre
+        self.date_filter_to.setMaximumWidth(130)
+        self.date_filter_to.dateChanged.connect(self.on_date_filter_changed)
+        tb3.addWidget(self.date_filter_to)
+
+        self.btn_clear_dates = QPushButton("Effacer dates", self)
+        self.btn_clear_dates.setMaximumWidth(100)
+        self.btn_clear_dates.setStyleSheet("padding: 2px 6px;")
+        self.btn_clear_dates.clicked.connect(self.on_clear_date_filters)
+        tb3.addWidget(self.btn_clear_dates)
+
         # Espace flexible pour pousser les éléments à gauche
         tb3.addWidget(QWidget())
 
@@ -3261,13 +3404,16 @@ class MainWindow(QMainWindow):
     def on_tab_changed(self, index):
         """Adapter les filtres selon l'onglet actif."""
         tab_name = self.tabs.tabText(index)
-        
+
         # Réinitialiser les combos
         self.filter1_combo.blockSignals(True)
         self.filter2_combo.blockSignals(True)
         self.filter1_combo.clear()
         self.filter2_combo.clear()
-        
+
+        # Reinitialiser les filtres date au changement d'onglet
+        self.on_clear_date_filters()
+
         if "Commandes" in tab_name:
             # Filtre 1: Statut commande
             self.filter1_combo.addItems(["Tous", "A suivre", "Envoyée"])
@@ -3296,7 +3442,9 @@ class MainWindow(QMainWindow):
             self.sep_rech2.setVisible(False)
             self.label_search_fact.setVisible(False)
             self.search_num_facture.setVisible(False)
-            
+            # Filtres date: visibles
+            self._set_date_filters_visible(True)
+
         elif "Factures" in tab_name and "Facturation" not in tab_name:
             # Filtre 1: Statut facture
             self.filter1_combo.addItems(["Tous", "Facturée", "Service fait", "En attente de paiement", "A vérifier"])
@@ -3327,7 +3475,9 @@ class MainWindow(QMainWindow):
             self.sep_rech2.setVisible(True)
             self.label_search_fact.setVisible(True)
             self.search_num_facture.setVisible(True)
-            
+            # Filtres date: visibles
+            self._set_date_filters_visible(True)
+
         elif "Facturation" in tab_name:
             # Filtre 1: Statut facturation
             self.filter1_combo.addItems(["Tous", "Non facturée", "Partiellement facturée", "Totalement facturée"])
@@ -3354,6 +3504,8 @@ class MainWindow(QMainWindow):
             self.sep_rech2.setVisible(False)
             self.label_search_fact.setVisible(False)
             self.search_num_facture.setVisible(False)
+            # Filtres date: visibles (filtre sur derniere_facture)
+            self._set_date_filters_visible(True)
 
         elif "Rappels" in tab_name:
             # Pas de filtres spécifiques pour rappels
@@ -3380,6 +3532,18 @@ class MainWindow(QMainWindow):
             self.sep_rech2.setVisible(False)
             self.label_search_fact.setVisible(False)
             self.search_num_facture.setVisible(False)
+            # Filtres date: cachés pour Rappels
+            self._set_date_filters_visible(False)
+
+        else:
+            # Onglets Marchés, Historique, etc. : masquer recherche, mais montrer dates
+            self.label_search_cmd.setVisible(False)
+            self.search_num_commande.setVisible(False)
+            self.sep_rech2.setVisible(False)
+            self.label_search_fact.setVisible(False)
+            self.search_num_facture.setVisible(False)
+            # Filtres date: visibles (pour Historique dans l'onglet Marchés)
+            self._set_date_filters_visible(True)
 
         self.filter1_combo.blockSignals(False)
         self.filter2_combo.blockSignals(False)
@@ -3561,6 +3725,70 @@ class MainWindow(QMainWindow):
 
         if "Factures" in tab_name and "Facturation" not in tab_name:
             self.fact_proxy.setNumFactureFilter(text)
+
+    def _set_date_filters_visible(self, visible):
+        """Affiche ou masque les widgets de filtre par date."""
+        self.sep_date.setVisible(visible)
+        self.label_date_du.setVisible(visible)
+        self.date_filter_from.setVisible(visible)
+        self.label_date_au.setVisible(visible)
+        self.date_filter_to.setVisible(visible)
+        self.btn_clear_dates.setVisible(visible)
+
+    def on_date_filter_changed(self):
+        """Applique le filtre par plage de dates sur l'onglet actif."""
+        min_date = QDate(2000, 1, 1)
+
+        # Determiner les valeurs : si la date est au minimum, pas de filtre
+        qd_from = self.date_filter_from.date()
+        qd_to = self.date_filter_to.date()
+
+        date_from = qd_from.toPyDate() if qd_from > min_date else None
+        date_to = qd_to.toPyDate() if qd_to > min_date else None
+
+        tab_index = self.tabs.currentIndex()
+        tab_name = self.tabs.tabText(tab_index)
+
+        if "Commandes" in tab_name:
+            self.cmd_proxy.setDateFilter(date_from, date_to)
+        elif "Factures" in tab_name and "Facturation" not in tab_name:
+            self.fact_proxy.setDateFilter(date_from, date_to)
+        elif "Facturation" in tab_name:
+            self.synth_proxy.setDateFilter(date_from, date_to)
+        elif "Historique" in tab_name:
+            self.historique_proxy.setDateFilter(date_from, date_to)
+
+    def on_clear_date_filters(self):
+        """Remet les filtres de dates a vide."""
+        min_date = QDate(2000, 1, 1)
+        self.date_filter_from.blockSignals(True)
+        self.date_filter_to.blockSignals(True)
+        self.date_filter_from.setDate(min_date)
+        self.date_filter_to.setDate(min_date)
+        self.date_filter_from.blockSignals(False)
+        self.date_filter_to.blockSignals(False)
+        # Appliquer le reset
+        self.on_date_filter_changed()
+
+    def _on_hist_date_changed(self):
+        """Applique le filtre date sur l'historique des marches."""
+        min_date = QDate(2000, 1, 1)
+        qd_from = self.date_filter_hist_from.date()
+        qd_to = self.date_filter_hist_to.date()
+        date_from = qd_from.toPyDate() if qd_from > min_date else None
+        date_to = qd_to.toPyDate() if qd_to > min_date else None
+        self.historique_proxy.setDateFilter(date_from, date_to)
+
+    def _on_clear_hist_dates(self):
+        """Remet les filtres date de l'historique a vide."""
+        min_date = QDate(2000, 1, 1)
+        self.date_filter_hist_from.blockSignals(True)
+        self.date_filter_hist_to.blockSignals(True)
+        self.date_filter_hist_from.setDate(min_date)
+        self.date_filter_hist_to.setDate(min_date)
+        self.date_filter_hist_from.blockSignals(False)
+        self.date_filter_hist_to.blockSignals(False)
+        self.historique_proxy.setDateFilter(None, None)
 
     def select_all_current_tab(self):
         """Sélectionner tout dans l'onglet actif."""
