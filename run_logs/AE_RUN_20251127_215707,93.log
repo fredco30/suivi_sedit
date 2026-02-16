@@ -1,0 +1,41 @@
+================================================================================
+TEST DES STATUTS FACTURES v5.1
+================================================================================
+
+Traceback (most recent call last):
+  File "C:\Users\Fred\LogSuiviBDC\test_statuts_factures.py", line 48, in test_statuts_factures
+    df = pd.read_excel("/mnt/user-data/uploads/liste_fact.xls")
+  File "C:\Users\Fred\AppData\Roaming\Python\Python313\site-packages\pandas\io\excel\_base.py", line 495, in read_excel
+    io = ExcelFile(
+        io,
+    ...<2 lines>...
+        engine_kwargs=engine_kwargs,
+    )
+  File "C:\Users\Fred\AppData\Roaming\Python\Python313\site-packages\pandas\io\excel\_base.py", line 1550, in __init__
+    ext = inspect_excel_format(
+        content_or_path=path_or_buffer, storage_options=storage_options
+    )
+  File "C:\Users\Fred\AppData\Roaming\Python\Python313\site-packages\pandas\io\excel\_base.py", line 1402, in inspect_excel_format
+    with get_handle(
+         ~~~~~~~~~~^
+        content_or_path, "rb", storage_options=storage_options, is_text=False
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ) as handle:
+    ^
+  File "C:\Users\Fred\AppData\Roaming\Python\Python313\site-packages\pandas\io\common.py", line 882, in get_handle
+    handle = open(handle, ioargs.mode)
+FileNotFoundError: [Errno 2] No such file or directory: '/mnt/user-data/uploads/liste_fact.xls'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "C:\Users\Fred\LogSuiviBDC\test_statuts_factures.py", line 187, in <module>
+    test_statuts_factures()
+    ~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\Fred\LogSuiviBDC\test_statuts_factures.py", line 181, in test_statuts_factures
+    print(f"\u2717 Erreur: {e}")
+    ~~~~~^^^^^^^^^^^^^^^^^^
+  File "C:\Python313\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2717' in position 0: character maps to <undefined>
