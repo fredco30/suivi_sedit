@@ -3846,14 +3846,19 @@ class MainWindow(QMainWindow):
         count = 0
 
         for _, row in df.iterrows():
-            exercice = "" if pd.isna(row["Exercice"]) else str(int(row["Exercice"]))
+            # BUG #8 fix: gestion robuste de l'exercice non numerique
+            try:
+                exercice = "" if pd.isna(row["Exercice"]) else str(int(float(row["Exercice"])))
+            except (ValueError, TypeError):
+                exercice = "" if pd.isna(row["Exercice"]) else str(row["Exercice"]).strip()
             num_facture = "" if col_facture is None or pd.isna(row[col_facture]) else str(row[col_facture])
             code_mouvement = "" if pd.isna(row["Code mouvement"]) else str(row["Code mouvement"])
             fournisseur = "" if pd.isna(row["Nom tiers"]) else str(row["Nom tiers"])
             libelle = "" if pd.isna(row["Libellé mouvement"]) else str(row["Libellé mouvement"])
             date_facture = parse_date_safe(row["Date service fait"])
             montant_ttc = None if col_montant_ttc is None or pd.isna(row[col_montant_ttc]) else float(row[col_montant_ttc])
-            montant_service_fait = 0.0 if pd.isna(row["Montant service fait"]) else float(row["Montant service fait"])
+            # BUG #9 fix: default coherent None au lieu de 0.0 pour montant_service_fait
+            montant_service_fait = None if pd.isna(row["Montant service fait"]) else float(row["Montant service fait"])
             marche = "" if col_marche is None or pd.isna(row[col_marche]) else str(row[col_marche])
 
             # Nouvelles colonnes pour l'analyse des marchés
@@ -3865,27 +3870,57 @@ class MainWindow(QMainWindow):
 
             statut = compute_facture_status(num_facture, montant_service_fait, date_facture)
 
+            # BUG #6 fix: upsert au lieu de INSERT direct pour eviter les doublons
+            # Cle d'unicite : (exercice, num_facture, code_mouvement)
             cur.execute(
                 """
-                INSERT INTO factures (
-                    exercice, num_facture, code_mouvement,
-                    fournisseur, libelle, date_facture,
-                    montant_ttc, montant_service_fait, marche,
-                    statut_facture,
-                    rappel_facture_actif, frequence_rappel_facture_jours,
-                    prochaine_date_rappel_facture, notes, last_update, source_file,
-                    tranche, commande, num_mandat, montant_initial
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                SELECT id FROM factures
+                WHERE exercice = ? AND num_facture = ? AND code_mouvement = ?
                 """,
-                (
-                    exercice, num_facture, code_mouvement,
-                    fournisseur, libelle, date_facture,
-                    montant_ttc, montant_service_fait, marche,
-                    statut,
-                    0, None, None, "", now, filename,
-                    tranche, commande, num_mandat, montant_initial
-                )
+                (exercice, num_facture, code_mouvement)
             )
+            existing = cur.fetchone()
+
+            if existing:
+                cur.execute(
+                    """
+                    UPDATE factures SET
+                        fournisseur = ?, libelle = ?, date_facture = ?,
+                        montant_ttc = ?, montant_service_fait = ?, marche = ?,
+                        statut_facture = ?, last_update = ?, source_file = ?,
+                        tranche = ?, commande = ?, num_mandat = ?, montant_initial = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        fournisseur, libelle, date_facture,
+                        montant_ttc, montant_service_fait or 0.0, marche,
+                        statut, now, filename,
+                        tranche, commande, num_mandat, montant_initial,
+                        existing["id"]
+                    )
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO factures (
+                        exercice, num_facture, code_mouvement,
+                        fournisseur, libelle, date_facture,
+                        montant_ttc, montant_service_fait, marche,
+                        statut_facture,
+                        rappel_facture_actif, frequence_rappel_facture_jours,
+                        prochaine_date_rappel_facture, notes, last_update, source_file,
+                        tranche, commande, num_mandat, montant_initial
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        exercice, num_facture, code_mouvement,
+                        fournisseur, libelle, date_facture,
+                        montant_ttc, montant_service_fait or 0.0, marche,
+                        statut,
+                        0, None, None, "", now, filename,
+                        tranche, commande, num_mandat, montant_initial
+                    )
+                )
             count += 1
 
         self.db.conn.commit()
@@ -5573,17 +5608,18 @@ class MainWindow(QMainWindow):
 
         print(f"[DEBUG] DataFrame créé avec {len(df)} lignes et colonnes: {list(df.columns)}")
 
-        # Si montant_initial est vide/null, utiliser montant_ttc comme fallback
+        # BUG #11 fix: ne PAS remplacer montant_initial par montant_ttc
+        # Le montant_initial d'un marche n'est pas le montant TTC d'une facture.
+        # Laisser le moteur de calcul (calculate_montant_initial_tranche) gerer
+        # les valeurs manquantes via sa propre logique (BD puis fallback Excel).
         try:
-            if 'montant_initial' in df.columns and 'montant_ttc' in df.columns:
-                # Remplacer les valeurs null de montant_initial par montant_ttc
-                df.loc[df['montant_initial'].isna(), 'montant_initial'] = df.loc[df['montant_initial'].isna(), 'montant_ttc']
-            elif 'montant_ttc' in df.columns:
-                # Si pas de colonne montant_initial, la créer
-                df['montant_initial'] = df['montant_ttc']
+            if 'montant_initial' not in df.columns:
+                df['montant_initial'] = 0.0
+            else:
+                # Remplacer uniquement les NaN par 0.0 (pas par montant_ttc)
+                df['montant_initial'] = df['montant_initial'].fillna(0.0)
         except Exception as e:
             print(f"[WARNING] Erreur lors du traitement de montant_initial: {e}")
-            # Fallback: créer une colonne vide
             if 'montant_initial' not in df.columns:
                 df['montant_initial'] = 0.0
 

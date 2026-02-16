@@ -207,6 +207,36 @@ class MarchesAnalyzer:
         except:
             return default
 
+    @staticmethod
+    def normalize_tranche_code(tranche) -> str:
+        """
+        BUG #7 fix: normalise une valeur de tranche en code standard.
+        Gere les valeurs: NaN, None, "", "0", "0.0", 0, 0.0, "TF",
+                          "1", "1.0", 1, "TO1", "TO2", etc.
+
+        Retourne: "TF", "TO1", "TO2", ... ou la valeur brute en string.
+        """
+        if pd.isna(tranche) or tranche == "" or tranche is None:
+            return "TF"
+
+        tranche_str = str(tranche).strip().upper()
+
+        # Deja un code standard
+        if tranche_str == "TF":
+            return "TF"
+        if tranche_str.startswith("TO") and tranche_str[2:].isdigit():
+            return tranche_str
+
+        # Essayer de convertir en nombre
+        try:
+            tranche_num = int(float(tranche))
+            if tranche_num == 0:
+                return "TF"
+            else:
+                return f"TO{tranche_num}"
+        except (ValueError, TypeError):
+            return tranche_str
+
     def calculate_montant_initial_tranche(self, marche: str, tranche) -> float:
         """
         Calcule le montant initial d'une tranche.
@@ -222,19 +252,12 @@ class MarchesAnalyzer:
         - Dédupliquer les valeurs positives (souvent répétées)
         - Additionner ces valeurs positives distinctes
         """
+        # BUG #7 fix: normaliser la tranche en code standard
+        code_tranche = self.normalize_tranche_code(tranche)
+
         # Essayer d'abord de charger depuis la base de données
         if self.db:
-            # Normaliser la tranche en valeur numérique
-            tranche_num = None
-            if not pd.isna(tranche):
-                try:
-                    tranche_num = float(tranche)
-                except (ValueError, TypeError):
-                    pass
-
-            # Convertir le numéro de tranche en code (0=TF, 1=TO1, 2=TO2, etc.)
-            if pd.isna(tranche) or tranche_num == 0:
-                code_tranche = "TF"
+            if code_tranche == "TF":
                 # Pour la TF, utiliser montant_initial_manuel du marché
                 marche_record = self.db.get_marche(marche)
                 if marche_record and marche_record["montant_initial_manuel"]:
@@ -242,10 +265,7 @@ class MarchesAnalyzer:
                     print(f"[TRANCHE] {marche} TF: {montant} € (depuis montant_initial_manuel)")
                     return montant
             else:
-                # Pour les TOs (TO1, TO2, etc.)
-                code_tranche = f"TO{int(tranche_num)}" if tranche_num else str(tranche)
-
-                # Pour les TOs, chercher dans la table tranches
+                # Pour les TOs (TO1, TO2, etc.), chercher dans la table tranches
                 cur = self.db.conn.cursor()
                 cur.execute(
                     "SELECT montant FROM tranches WHERE code_marche = ? AND code_tranche = ?",
@@ -357,9 +377,11 @@ class MarchesAnalyzer:
         results = []
 
         # Grouper par (marché, tranche)
+        # BUG #12 fix: dropna=False pour inclure les lignes avec tranche NaN/None
         grouped = self.df_marches.groupby(
             [self.df_marches.iloc[:, self.COL_MARCHE],
-             self.df_marches.iloc[:, self.COL_TRANCHE]]
+             self.df_marches.iloc[:, self.COL_TRANCHE]],
+            dropna=False
         )
 
         for (marche, tranche), _ in grouped:
@@ -372,19 +394,8 @@ class MarchesAnalyzer:
             if montant_initial > 0:
                 pourcent = (service_fait / montant_initial) * 100
 
-            # Formater le libellé de la tranche
-            if pd.isna(tranche):
-                tranche_libelle = "Sans tranche"
-            else:
-                # Si c'est un nombre, formater en TF, TO1, TO2...
-                try:
-                    tranche_num = int(float(tranche))
-                    if tranche_num == 0:
-                        tranche_libelle = "TF"
-                    else:
-                        tranche_libelle = f"TO{tranche_num}"
-                except:
-                    tranche_libelle = str(tranche)
+            # Formater le libellé de la tranche via la normalisation
+            tranche_libelle = self.normalize_tranche_code(tranche)
 
             results.append({
                 'marche': marche,
@@ -436,24 +447,28 @@ class MarchesAnalyzer:
             libelle = libelles.iloc[0] if len(libelles) > 0 else ""
 
             # Calculer le montant initial du marché
-            # Priorité 1: Montant manuel + avenants depuis la BD
-            # Priorité 2: Calcul automatique depuis Excel (somme des tranches)
+            # Priorité 1: Si le marché existe en BD, utiliser exclusivement le calcul BD
+            #             (montant_initial_manuel + tranches TO + avenants)
+            # Priorité 2: Sinon, calcul automatique depuis Excel (somme des tranches)
             montant_initial_marche = 0.0
             montant_excel = 0.0
             nb_avenants = 0
 
+            # BUG #1 fix: verifier l'existence du marche en BD, pas juste si montant > 0
+            marche_exists_in_db = False
             if self.db:
-                # Essayer de récupérer le montant depuis la base de données
-                montant_bd = self.db.get_montant_total_marche(marche)
-                if montant_bd > 0:
-                    montant_initial_marche = montant_bd
+                marche_record = self.db.get_marche(marche)
+                if marche_record:
+                    marche_exists_in_db = True
+                    # Utiliser exclusivement le calcul BD (TF + TOs + avenants)
+                    montant_initial_marche = self.db.get_montant_total_marche(marche)
 
-                    # Récupérer le nombre d'avenants pour affichage
+                    # Recuperer le nombre d'avenants pour affichage
                     avenants = self.db.get_avenants(marche)
                     nb_avenants = len(avenants) if avenants else 0
 
-            # Si pas de montant manuel en BD, calculer depuis Excel
-            if montant_initial_marche == 0:
+            # Uniquement si aucune configuration manuelle en BD, fallback Excel
+            if not marche_exists_in_db:
                 tranches = df_marche.iloc[:, self.COL_TRANCHE].unique()
                 montant_excel = sum(
                     self.calculate_montant_initial_tranche(marche, t)
@@ -741,8 +756,20 @@ class MarchesAnalyzer:
                 'statut': statut
             })
 
-        # Trier par marché puis par date
-        results.sort(key=lambda x: (x['marche'], x['date_sf']), reverse=True)
+        # BUG #17 fix: trier par date en parsant dd/mm/yyyy au lieu d'un tri string
+        def parse_date_for_sort(date_str):
+            """Convertit dd/mm/yyyy en tuple (yyyy, mm, dd) pour tri correct."""
+            if not date_str:
+                return (0, 0, 0)
+            try:
+                parts = date_str.split('/')
+                if len(parts) == 3:
+                    return (int(parts[2]), int(parts[1]), int(parts[0]))
+            except (ValueError, IndexError):
+                pass
+            return (0, 0, 0)
+
+        results.sort(key=lambda x: (x['marche'], parse_date_for_sort(x['date_sf'])), reverse=True)
 
         return results
 
@@ -1183,14 +1210,8 @@ class MarchesAnalyzer:
                 # Récupérer le type de marché
                 type_marche = marches_types.get(marche, 'CLASSIQUE')
 
-                # Formater la tranche
-                tranche_libelle = ""
-                if pd.notna(tranche):
-                    try:
-                        tranche_num = int(float(tranche))
-                        tranche_libelle = "TF" if tranche_num == 0 else f"TO{tranche_num}"
-                    except:
-                        tranche_libelle = str(tranche)
+                # Formater la tranche via normalisation
+                tranche_libelle = self.normalize_tranche_code(tranche)
 
                 montant_initial_tranche = self.calculate_montant_initial_tranche(marche, tranche)
 
@@ -1271,7 +1292,16 @@ class MarchesAnalyzer:
                 # Écrire chaque facture
                 for facture in factures:
                     montant_ttc = facture['montant_ttc']
-                    montant_ht = montant_ttc / 1.2 if montant_ttc > 0 else facture['montant_sf'] / 1.2
+                    # BUG #3 fix: ne pas utiliser un taux de TVA en dur (20%)
+                    # Utiliser montant_sf comme meilleure approximation du HT
+                    # car le taux TVA peut varier (5.5%, 10%, 20%, 0%)
+                    montant_sf = facture['montant_sf']
+                    if montant_sf > 0:
+                        montant_ht = montant_sf
+                    elif montant_ttc > 0:
+                        montant_ht = montant_ttc
+                    else:
+                        montant_ht = 0.0
 
                     # Données de la ligne
                     ws_financier.cell(row_idx, 1, "TRAVAUX")
@@ -1449,13 +1479,7 @@ class MarchesAnalyzer:
                     continue
 
                 tranche = df_marche.iloc[0, self.COL_TRANCHE]
-                tranche_libelle = ""
-                if pd.notna(tranche):
-                    try:
-                        tranche_num = int(float(tranche))
-                        tranche_libelle = "TF" if tranche_num == 0 else f"TO{tranche_num}"
-                    except:
-                        tranche_libelle = str(tranche)
+                tranche_libelle = self.normalize_tranche_code(tranche)
 
                 montant_initial = self.calculate_montant_initial_tranche(marche, tranche)
                 service_fait = self.calculate_service_fait_tranche(marche, tranche)

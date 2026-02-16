@@ -214,13 +214,11 @@ class EditMarcheDialog(QDialog):
         """Appelé quand le type de marché change."""
         type_marche = self.combo_type.currentData()
 
-        # Pour les marchés à BDC, le montant initial n'a pas de sens
-        # (il est calculé depuis les BDC eux-mêmes)
-        # Et la section tranches n'est pas pertinente
+        # BUG #2 + #20 fix: pour les marches BDC, le montant initial sert de plafond
+        # Ne PAS ecraser la valeur a 0 - la conserver pour le calcul du plafond
         if type_marche == "BDC":
-            self.spin_montant.setEnabled(False)
-            self.spin_montant.setValue(0)
-            self.spin_montant.setStyleSheet("background-color: #f0f0f0;")
+            self.spin_montant.setEnabled(True)
+            self.spin_montant.setStyleSheet("")
             self.group_tranches.setVisible(False)
         else:
             self.spin_montant.setEnabled(True)
