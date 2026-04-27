@@ -569,6 +569,156 @@ class MatchingEngine:
         parsed["_raw"] = raw
         return parsed
 
+    # ------------------------------------------------------------------
+    # batch_ai_match (etape 5) : helpers + boucle
+    # ------------------------------------------------------------------
+
+    def list_cmd_ids_for_batch(self,
+                               diagnostics: Optional[list] = None,
+                               include_dismissed: bool = False) -> list:
+        """Liste les commande_id eligibles pour un batch IA.
+
+        Defaults : diagnostics actionnables (RAPPROCHEMENT_SUGGERE par defaut).
+        Exclut les commandes ecartees (dismissed_until > today) sauf si
+        include_dismissed=True.
+        """
+        if diagnostics is None:
+            diagnostics = [DIAG_RAPPROCHEMENT_SUGGERE]
+        if not diagnostics:
+            return []
+        placeholders = ",".join("?" for _ in diagnostics)
+        sql = (
+            f"SELECT commande_id FROM commande_diagnostic "
+            f"WHERE diagnostic IN ({placeholders})"
+        )
+        params = list(diagnostics)
+        if not include_dismissed:
+            sql += " AND (dismissed_until IS NULL OR dismissed_until <= ?)"
+            params.append(self.today.isoformat())
+        sql += " ORDER BY severite DESC, commande_id"
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        return [r["commande_id"] for r in cur.fetchall()]
+
+    def batch_ai_match(self, cmd_ids: list,
+                       client: "DeepSeekClient",
+                       auto_threshold: int = 90,
+                       min_threshold: int = 40,
+                       apply_decisions: bool = True,
+                       use_cache: bool = True,
+                       max_age_days: int = 7,
+                       progress_callback: Optional[callable] = None,
+                       cancel_check: Optional[callable] = None) -> dict:
+        """Analyse en lot une liste de commandes.
+
+        - progress_callback(i, total, message) : appele apres chaque commande.
+        - cancel_check() : si True, arrete proprement la boucle.
+
+        Pour chaque commande :
+        1. find_candidates -> si vide, skip (compte dans 'skipped_no_candidate')
+        2. ai_match avec use_cache (peut servir le cache sans appel API)
+        3. si apply_decisions : apply_ai_decision (auto_doublon / auto_link /
+           suggestion / ignored). Sinon : classification report-only.
+
+        Renvoie un summary dict avec compteurs par categorie + errors.
+        """
+        summary = {
+            "total": len(cmd_ids),
+            "processed": 0,
+            "ai_called": 0,
+            "from_cache": 0,
+            "auto_doublon": 0,
+            "auto_linked": 0,
+            "suggestions": 0,
+            "ignored": 0,
+            "skipped_no_candidate": 0,
+            "errors": [],
+            "cancelled": False,
+        }
+
+        for i, cmd_id in enumerate(cmd_ids):
+            if cancel_check is not None and cancel_check():
+                summary["cancelled"] = True
+                if progress_callback is not None:
+                    progress_callback(i, len(cmd_ids), "Annule.")
+                break
+
+            try:
+                candidates = self.find_candidates(cmd_id)
+            except Exception as e:
+                summary["errors"].append((cmd_id, f"find_candidates: {e}"))
+                if progress_callback is not None:
+                    progress_callback(i + 1, len(cmd_ids),
+                                      f"cmd #{cmd_id}: erreur find_candidates")
+                continue
+
+            if not candidates:
+                summary["skipped_no_candidate"] += 1
+                if progress_callback is not None:
+                    progress_callback(i + 1, len(cmd_ids),
+                                      f"cmd #{cmd_id}: aucun candidat, ignoree")
+                continue
+
+            try:
+                response = self.ai_match(
+                    cmd_id, candidates, client,
+                    use_cache=use_cache, max_age_days=max_age_days,
+                )
+            except Exception as e:
+                summary["errors"].append((cmd_id, f"ai_match: {e}"))
+                if progress_callback is not None:
+                    progress_callback(i + 1, len(cmd_ids),
+                                      f"cmd #{cmd_id}: erreur IA")
+                continue
+
+            summary["processed"] += 1
+            if response.get("_from_cache"):
+                summary["from_cache"] += 1
+            else:
+                summary["ai_called"] += 1
+
+            if apply_decisions:
+                try:
+                    action = apply_ai_decision(
+                        self.conn, self.link_repo, cmd_id, response,
+                        auto_threshold=auto_threshold,
+                        min_threshold=min_threshold,
+                    )
+                except Exception as e:
+                    summary["errors"].append(
+                        (cmd_id, f"apply_ai_decision: {e}")
+                    )
+                    action = ACTION_IGNORED
+            else:
+                confidence = int(response.get("confidence", 0))
+                diag = response.get("diagnostic")
+                act = response.get("action_suggeree")
+                if (diag == "DOUBLON" and act == "MARQUER_DOUBLON"
+                        and confidence >= auto_threshold):
+                    action = ACTION_AUTO_DOUBLON
+                elif (diag in ("MATCH", "PARTIEL") and act == "VALIDER_AUTO"
+                      and confidence >= auto_threshold):
+                    action = ACTION_AUTO_LINKED
+                elif confidence >= min_threshold:
+                    action = ACTION_SUGGESTION
+                else:
+                    action = ACTION_IGNORED
+
+            if action == ACTION_AUTO_DOUBLON:
+                summary["auto_doublon"] += 1
+            elif action == ACTION_AUTO_LINKED:
+                summary["auto_linked"] += 1
+            elif action == ACTION_SUGGESTION:
+                summary["suggestions"] += 1
+            else:
+                summary["ignored"] += 1
+
+            if progress_callback is not None:
+                progress_callback(i + 1, len(cmd_ids),
+                                  f"cmd #{cmd_id}: {action}")
+
+        return summary
+
 
 # ============================================================================
 # DeepSeekClient + helpers IA (etape 4)

@@ -941,5 +941,198 @@ class TestApplyAiDecision(unittest.TestCase):
         self.assertEqual(action, ACTION_IGNORED)
 
 
+# ============================================================================
+# Tests etape 5 : list_cmd_ids_for_batch + batch_ai_match
+# ============================================================================
+
+
+class TestListCmdIdsForBatch(unittest.TestCase):
+    def setUp(self):
+        self.conn = make_db()
+        self.repo = LinkRepository(self.conn)
+        self.engine = MatchingEngine(self.conn, self.repo, today=date(2025, 6, 1))
+        cur = self.conn.cursor()
+        for i in range(3):
+            cur.execute(
+                "INSERT INTO commandes (num_commande, fournisseur, montant_ttc) "
+                "VALUES (?, ?, ?)",
+                (f"25AA0000{i+1}", "ACAF", 1000.0),
+            )
+        self.conn.commit()
+        cur.executemany(
+            "INSERT INTO commande_diagnostic "
+            "(commande_id, diagnostic, severite, last_diagnostic_at, "
+            "dismissed_until) VALUES (?, ?, ?, ?, ?)",
+            [
+                (1, DIAG_RAPPROCHEMENT_SUGGERE, 2, "2025-06-01T00:00:00", None),
+                (2, DIAG_OUBLI_PROBABLE, 3, "2025-06-01T00:00:00", None),
+                (3, DIAG_RAPPROCHEMENT_SUGGERE, 2, "2025-06-01T00:00:00",
+                 "2025-12-31"),
+            ],
+        )
+        self.conn.commit()
+
+    def test_default_only_suggested_not_dismissed(self):
+        ids = self.engine.list_cmd_ids_for_batch()
+        self.assertEqual(ids, [1])
+
+    def test_include_dismissed(self):
+        ids = self.engine.list_cmd_ids_for_batch(include_dismissed=True)
+        self.assertEqual(set(ids), {1, 3})
+
+    def test_custom_diagnostics(self):
+        ids = self.engine.list_cmd_ids_for_batch(
+            diagnostics=[DIAG_RAPPROCHEMENT_SUGGERE, DIAG_OUBLI_PROBABLE]
+        )
+        self.assertEqual(set(ids), {1, 2})
+
+    def test_empty_diagnostics_returns_empty(self):
+        self.assertEqual(self.engine.list_cmd_ids_for_batch(diagnostics=[]), [])
+
+
+class TestBatchAiMatch(unittest.TestCase):
+    def setUp(self):
+        self.conn = make_db()
+        self.repo = LinkRepository(self.conn)
+        self.engine = MatchingEngine(self.conn, self.repo, today=date(2025, 6, 1))
+
+        cur = self.conn.cursor()
+        # Dates alignees pour que find_candidates passe : cmd 2025-01-01,
+        # fact 2025-01-13 (apres cmd, dans la fenetre 30j tolerance).
+        for i in range(1, 4):
+            cur.execute(
+                "INSERT INTO commandes (num_commande, fournisseur, libelle, "
+                "date_commande, marche, montant_ttc, reste_a_facturer) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (f"25AA0148{i}", "ACAF", f"Maintenance {i}",
+                 "2025-01-01", "2023_17", 1000.0, 1000.0),
+            )
+            cur.execute(
+                "INSERT INTO factures (num_facture, code_mouvement, fournisseur, "
+                "marche, date_facture, montant_service_fait, libelle) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (f"F{i}", f"25AA0007{i}", "ACAF", "2023_17",
+                 "2025-01-13", 500.0, f"Maintenance {i}"),
+            )
+        self.conn.commit()
+        self.cmd_ids = [1, 2, 3]
+
+    def _client_returning(self, response_dict):
+        client = MagicMock(spec=DeepSeekClient)
+        import json as _json
+        client.chat.return_value = _json.dumps(response_dict)
+        return client
+
+    def test_batch_processes_all_with_auto_doublon(self):
+        client = self._client_returning({
+            "diagnostic": "DOUBLON", "confidence": 95,
+            "factures_a_lier": [], "raisonnement": "doublon",
+            "action_suggeree": "MARQUER_DOUBLON",
+        })
+        summary = self.engine.batch_ai_match(self.cmd_ids, client)
+        self.assertEqual(summary["total"], 3)
+        self.assertEqual(summary["processed"], 3)
+        self.assertEqual(summary["auto_doublon"], 3)
+        self.assertEqual(summary["ai_called"], 3)
+        self.assertEqual(summary["from_cache"], 0)
+        self.assertFalse(summary["cancelled"])
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM commandes WHERE statut_metier = 'DOUBLON_ADMIN'")
+        self.assertEqual(cur.fetchone()[0], 3)
+
+    def test_batch_uses_cache_on_second_call(self):
+        client = self._client_returning({
+            "diagnostic": "MATCH", "confidence": 75,
+            "factures_a_lier": [], "raisonnement": "ok",
+            "action_suggeree": "VALIDER_MANUEL",
+        })
+        s1 = self.engine.batch_ai_match(self.cmd_ids, client)
+        self.assertEqual(s1["ai_called"], 3)
+        s2 = self.engine.batch_ai_match(self.cmd_ids, client)
+        self.assertEqual(s2["ai_called"], 0)
+        self.assertEqual(s2["from_cache"], 3)
+
+    def test_batch_progress_callback_called(self):
+        client = self._client_returning({
+            "diagnostic": "INDETERMINE", "confidence": 30,
+            "factures_a_lier": [], "raisonnement": "?",
+            "action_suggeree": "INVESTIGUER",
+        })
+        calls = []
+        self.engine.batch_ai_match(
+            self.cmd_ids, client,
+            progress_callback=lambda i, n, msg: calls.append((i, n, msg)),
+        )
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[-1][0], 3)
+        self.assertEqual(calls[-1][1], 3)
+
+    def test_batch_cancel_stops_loop(self):
+        client = self._client_returning({
+            "diagnostic": "MATCH", "confidence": 50,
+            "factures_a_lier": [], "raisonnement": "ok",
+            "action_suggeree": "VALIDER_MANUEL",
+        })
+        summary = self.engine.batch_ai_match(
+            self.cmd_ids, client,
+            cancel_check=lambda: True,
+        )
+        self.assertTrue(summary["cancelled"])
+        self.assertEqual(summary["processed"], 0)
+
+    def test_batch_cancel_after_n_processes(self):
+        client = self._client_returning({
+            "diagnostic": "MATCH", "confidence": 50,
+            "factures_a_lier": [], "raisonnement": "ok",
+            "action_suggeree": "VALIDER_MANUEL",
+        })
+        counter = {"n": 0}
+
+        def cancel():
+            counter["n"] += 1
+            return counter["n"] > 1
+
+        summary = self.engine.batch_ai_match(self.cmd_ids, client,
+                                             cancel_check=cancel)
+        self.assertTrue(summary["cancelled"])
+        self.assertEqual(summary["processed"], 1)
+
+    def test_batch_skips_no_candidate(self):
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM factures")
+        self.conn.commit()
+        client = self._client_returning({
+            "diagnostic": "MATCH", "confidence": 50,
+            "factures_a_lier": [], "raisonnement": "ok",
+            "action_suggeree": "VALIDER_MANUEL",
+        })
+        summary = self.engine.batch_ai_match(self.cmd_ids, client)
+        self.assertEqual(summary["skipped_no_candidate"], 3)
+        self.assertEqual(summary["processed"], 0)
+        client.chat.assert_not_called()
+
+    def test_batch_records_errors(self):
+        client = MagicMock(spec=DeepSeekClient)
+        client.chat.side_effect = RuntimeError("API down")
+        summary = self.engine.batch_ai_match(self.cmd_ids, client)
+        self.assertEqual(summary["processed"], 0)
+        self.assertEqual(len(summary["errors"]), 3)
+        self.assertEqual(summary["errors"][0][0], 1)
+
+    def test_batch_apply_decisions_false(self):
+        client = self._client_returning({
+            "diagnostic": "DOUBLON", "confidence": 95,
+            "factures_a_lier": [], "raisonnement": "doublon",
+            "action_suggeree": "MARQUER_DOUBLON",
+        })
+        summary = self.engine.batch_ai_match(
+            self.cmd_ids, client, apply_decisions=False,
+        )
+        self.assertEqual(summary["auto_doublon"], 3)
+        cur = self.conn.cursor()
+        cur.execute("SELECT COUNT(*) FROM commandes WHERE statut_metier = 'DOUBLON_ADMIN'")
+        self.assertEqual(cur.fetchone()[0], 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

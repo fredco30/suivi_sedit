@@ -2252,6 +2252,19 @@ class ConfigDialog(QDialog):
         self.ia_enabled_check.setChecked(self.db.get_config("ai_enabled", "0") == "1")
         form_ia.addRow(self.ia_enabled_check)
 
+        self.ia_auto_scan_check = QCheckBox(
+            "Lancer une analyse IA automatique apres chaque import Excel"
+        )
+        self.ia_auto_scan_check.setChecked(
+            self.db.get_config("ai_auto_scan_after_import", "0") == "1"
+        )
+        self.ia_auto_scan_check.setToolTip(
+            "Si active : apres chaque import incremental, l'IA analyse "
+            "automatiquement les commandes RAPPROCHEMENT_SUGGERE non encore "
+            "analysees. Desactive par defaut pour eviter des couts non souhaites."
+        )
+        form_ia.addRow(self.ia_auto_scan_check)
+
         self.ia_api_key_edit = QLineEdit(self.db.get_config("deepseek_api_key", "") or "")
         self.ia_api_key_edit.setEchoMode(QLineEdit.Password)
         self.ia_api_key_edit.setPlaceholderText("sk-...")
@@ -2378,6 +2391,10 @@ class ConfigDialog(QDialog):
         # Sauvegarder config IA
         self.db.set_config(
             "ai_enabled", "1" if self.ia_enabled_check.isChecked() else "0"
+        )
+        self.db.set_config(
+            "ai_auto_scan_after_import",
+            "1" if self.ia_auto_scan_check.isChecked() else "0",
         )
         self.db.set_config("deepseek_api_key", self.ia_api_key_edit.text().strip())
         self.db.set_config("deepseek_model", self.ia_model_combo.currentText().strip())
@@ -3949,6 +3966,106 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Import terminé avec erreurs", result_msg)
         else:
             QMessageBox.information(self, "Import réussi", result_msg)
+
+        # Auto-scan IA optionnel apres import (etape 5)
+        self._maybe_run_auto_ai_scan()
+
+    def _maybe_run_auto_ai_scan(self):
+        """Si ai_auto_scan_after_import==1 et IA configuree, lance un batch IA
+        en tache de fond sur les commandes RAPPROCHEMENT_SUGGERE.
+        """
+        if self.db.get_config("ai_auto_scan_after_import", "0") != "1":
+            return
+        if self.db.get_config("ai_enabled", "0") != "1":
+            return
+        api_key = (self.db.get_config("deepseek_api_key", "") or "").strip()
+        if not api_key:
+            return
+        try:
+            from matching_module import (
+                DIAG_RAPPROCHEMENT_SUGGERE,
+                DeepSeekClient,
+                LinkRepository,
+                MatchingEngine,
+            )
+            from matching_dialog import BatchAiWorker
+        except ImportError as e:
+            print(f"[AUTO-IA] Import KO : {e}")
+            return
+
+        # On declenche un diagnose pour avoir une liste a jour
+        link_repo = LinkRepository(self.db.conn)
+        engine = MatchingEngine(self.db.conn, link_repo)
+        engine.diagnose_all_commandes()
+        cmd_ids = engine.list_cmd_ids_for_batch(
+            diagnostics=[DIAG_RAPPROCHEMENT_SUGGERE]
+        )
+        if not cmd_ids:
+            return
+
+        try:
+            auto_thr = int(self.db.get_config("ai_auto_threshold", "90") or 90)
+            min_thr = int(self.db.get_config("ai_min_threshold", "40") or 40)
+        except (TypeError, ValueError):
+            auto_thr, min_thr = 90, 40
+
+        model = self.db.get_config("deepseek_model", "deepseek-chat") or "deepseek-chat"
+        endpoint = (self.db.get_config(
+            "deepseek_endpoint",
+            "https://api.deepseek.com/v1/chat/completions",
+        ) or "https://api.deepseek.com/v1/chat/completions")
+        client = DeepSeekClient(api_key=api_key, model=model,
+                                endpoint=endpoint, timeout=30)
+
+        n = len(cmd_ids)
+        # Notification non-bloquante via la statusbar (ou print fallback)
+        msg_start = f"Auto-scan IA : analyse de {n} commande(s) en arriere-plan..."
+        if hasattr(self, "statusBar"):
+            try:
+                self.statusBar().showMessage(msg_start, 60000)
+            except Exception:
+                pass
+        print(f"[AUTO-IA] {msg_start}")
+
+        worker = BatchAiWorker(
+            engine, cmd_ids, client,
+            auto_threshold=auto_thr, min_threshold=min_thr,
+            apply_decisions=True, use_cache=True,
+        )
+
+        def _on_finished(summary):
+            self.db.recompute_facturation()
+            try:
+                self.cmd_model.refresh()
+                self.synth_model.refresh()
+            except Exception:
+                pass
+            msg_done = (
+                f"Auto-scan IA termine : {summary['auto_doublon']} doublons, "
+                f"{summary['auto_linked']} liens, {summary['suggestions']} suggestions, "
+                f"{len(summary.get('errors', []))} erreur(s)."
+            )
+            if hasattr(self, "statusBar"):
+                try:
+                    self.statusBar().showMessage(msg_done, 30000)
+                except Exception:
+                    pass
+            print(f"[AUTO-IA] {msg_done}")
+
+        def _on_error(msg):
+            err = f"Auto-scan IA en erreur : {msg}"
+            if hasattr(self, "statusBar"):
+                try:
+                    self.statusBar().showMessage(err, 30000)
+                except Exception:
+                    pass
+            print(f"[AUTO-IA] {err}")
+
+        worker.finished_with_summary.connect(_on_finished)
+        worker.finished_with_error.connect(_on_error)
+        # Garder une reference pour eviter le GC
+        self._auto_ai_worker = worker
+        worker.start()
 
     def import_commandes_from_file(self, filepath: str) -> int:
         """

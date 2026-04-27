@@ -26,6 +26,7 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QLabel,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -261,6 +262,13 @@ class MatchingDialog(QDialog):
         btn_refresh.clicked.connect(self.refresh_all)
         layout.addWidget(btn_refresh)
 
+        self.btn_batch_ai = QPushButton("🤖 Analyser en lot")
+        self.btn_batch_ai.setToolTip(
+            "Analyse IA de toutes les commandes RAPPROCHEMENT_SUGGERE non ecartees"
+        )
+        self.btn_batch_ai.clicked.connect(self._on_batch_ai_clicked)
+        layout.addWidget(self.btn_batch_ai)
+
         return frame
 
     def _build_left_panel(self) -> QWidget:
@@ -436,9 +444,29 @@ class MatchingDialog(QDialog):
             self._populate_fournisseurs_combo()
             self._apply_filters()
             self._update_counts_label(counts)
+            self._update_batch_button_state()
             self.status_label.setText("Diagnostic recalcule.")
         finally:
             QApplication.restoreOverrideCursor()
+
+    def _update_batch_button_state(self):
+        ai_ready = self._is_ai_configured()
+        n_eligible = len(self.engine.list_cmd_ids_for_batch(
+            diagnostics=[DIAG_RAPPROCHEMENT_SUGGERE]
+        ))
+        self.btn_batch_ai.setEnabled(ai_ready and n_eligible > 0)
+        if not ai_ready:
+            self.btn_batch_ai.setToolTip(
+                "Configurer la cle API DeepSeek dans Configuration / Onglet IA"
+            )
+        elif n_eligible == 0:
+            self.btn_batch_ai.setToolTip(
+                "Aucune commande RAPPROCHEMENT_SUGGERE en attente d'analyse"
+            )
+        else:
+            self.btn_batch_ai.setToolTip(
+                f"Analyse IA de {n_eligible} commande(s) RAPPROCHEMENT_SUGGERE"
+            )
 
     def _load_rows(self):
         """Charge en memoire toutes les lignes commandes + diagnostic."""
@@ -1168,6 +1196,139 @@ class MatchingDialog(QDialog):
         self._recompute_after_action()
 
     # ------------------------------------------------------------------
+    # IA en lot (etape 5)
+    # ------------------------------------------------------------------
+
+    def _on_batch_ai_clicked(self):
+        if self._ai_worker is not None and self._ai_worker.isRunning():
+            QMessageBox.information(
+                self, "IA en cours",
+                "Un appel IA est deja en cours, attendez sa fin."
+            )
+            return
+        client = self._build_ai_client()
+        if client is None:
+            QMessageBox.warning(
+                self, "IA non configuree",
+                "Configurer la cle API DeepSeek dans Configuration / Onglet IA."
+            )
+            return
+        cmd_ids = self.engine.list_cmd_ids_for_batch(
+            diagnostics=[DIAG_RAPPROCHEMENT_SUGGERE]
+        )
+        if not cmd_ids:
+            QMessageBox.information(
+                self, "Rien a analyser",
+                "Aucune commande RAPPROCHEMENT_SUGGERE non ecartee."
+            )
+            return
+
+        # Estimation cout et duree (~0.1ct/cmd, ~3s/cmd selon spec 7.6)
+        n = len(cmd_ids)
+        cost_cents = max(1, round(n * 0.1, 1))
+        eta_s = n * 3
+        ans = QMessageBox.question(
+            self, "Analyser en lot",
+            f"Lancer l'analyse IA pour {n} commande(s) RAPPROCHEMENT_SUGGERE ?\n\n"
+            f"- Cout estime : ~{cost_cents} centimes\n"
+            f"- Duree estimee : ~{eta_s}s ({n} appels en serie)\n"
+            f"- Les decisions a confiance >= seuil auto seront appliquees automatiquement.\n"
+            f"- Les commandes deja analysees recemment utiliseront le cache (gratuit).\n\n"
+            "Continuer ?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        # Seuils
+        try:
+            auto_thr = int(self.db.get_config("ai_auto_threshold", "90") or 90)
+            min_thr = int(self.db.get_config("ai_min_threshold", "40") or 40)
+        except (TypeError, ValueError):
+            auto_thr, min_thr = 90, 40
+
+        # Progress dialog avec cancel
+        progress = QProgressDialog(
+            "Analyse IA en lot...", "Annuler", 0, n, self
+        )
+        progress.setWindowTitle("Batch IA")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setAutoClose(True)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        cancel_state = {"cancel": False}
+        progress.canceled.connect(lambda: cancel_state.update({"cancel": True}))
+
+        worker = BatchAiWorker(
+            self.engine, cmd_ids, client,
+            auto_threshold=auto_thr, min_threshold=min_thr,
+            cancel_check=lambda: cancel_state["cancel"],
+        )
+
+        def _on_progress(i, total, msg):
+            progress.setMaximum(total)
+            progress.setValue(i)
+            progress.setLabelText(f"({i}/{total}) {msg}")
+
+        worker.progress.connect(_on_progress)
+        worker.finished_with_summary.connect(
+            lambda summary: self._on_batch_finished(summary, progress)
+        )
+        worker.finished_with_error.connect(
+            lambda msg: self._on_batch_error(msg, progress)
+        )
+        worker.finished.connect(lambda: setattr(self, "_ai_worker", None))
+
+        self._ai_worker = worker
+        self.btn_batch_ai.setEnabled(False)
+        self.status_label.setText(f"Batch IA en cours sur {n} commande(s)...")
+        worker.start()
+
+    def _on_batch_finished(self, summary: dict, progress: QProgressDialog):
+        progress.setValue(progress.maximum())
+        # Recompute global + refresh
+        self._recompute_after_action()
+        self._update_batch_button_state()
+
+        cancelled = " (interrompu)" if summary.get("cancelled") else ""
+        details = (
+            f"<b>Batch IA termine{cancelled}</b><br><br>"
+            f"Total : {summary['total']}<br>"
+            f"Traitees : {summary['processed']}<br>"
+            f"&nbsp;&nbsp;Appels API : {summary['ai_called']}<br>"
+            f"&nbsp;&nbsp;Cache : {summary['from_cache']}<br>"
+            f"<br>"
+            f"Resultats :<br>"
+            f"&nbsp;&nbsp;Auto-doublons : {summary['auto_doublon']}<br>"
+            f"&nbsp;&nbsp;Auto-liens : {summary['auto_linked']}<br>"
+            f"&nbsp;&nbsp;Suggestions (sous seuil auto) : {summary['suggestions']}<br>"
+            f"&nbsp;&nbsp;Ignorees : {summary['ignored']}<br>"
+            f"&nbsp;&nbsp;Sans candidat : {summary['skipped_no_candidate']}<br>"
+        )
+        if summary.get("errors"):
+            n_err = len(summary["errors"])
+            details += f"<br><b>{n_err} erreur(s)</b><br>"
+            for cmd_id, msg in summary["errors"][:5]:
+                details += f"&nbsp;&nbsp;cmd #{cmd_id} : {msg[:100]}<br>"
+            if n_err > 5:
+                details += f"&nbsp;&nbsp;... et {n_err - 5} autre(s)<br>"
+
+        self.status_label.setText(
+            f"Batch IA : {summary['auto_doublon']} doublons, "
+            f"{summary['auto_linked']} liens, "
+            f"{summary['suggestions']} suggestions."
+        )
+        QMessageBox.information(self, "Batch IA termine", details)
+
+    def _on_batch_error(self, msg: str, progress: QProgressDialog):
+        progress.cancel()
+        self._update_batch_button_state()
+        self.status_label.setText("Erreur batch IA.")
+        QMessageBox.critical(self, "Erreur batch IA",
+                             f"L'analyse en lot a echoue :\n\n{msg}")
+
+    # ------------------------------------------------------------------
     # Persistance geometrie
     # ------------------------------------------------------------------
 
@@ -1222,5 +1383,56 @@ class AiWorker(QThread):
                 use_cache=self.use_cache,
             )
             self.finished_with_response.emit(response)
+        except Exception as e:
+            self.finished_with_error.emit(f"{type(e).__name__}: {e}")
+
+
+# ============================================================================
+# BatchAiWorker : analyse en lot de N commandes (etape 5)
+# ============================================================================
+
+class BatchAiWorker(QThread):
+    """Encapsule batch_ai_match dans un thread pour ne pas bloquer l'UI.
+
+    Emet :
+    - progress(i, total, message) apres chaque commande
+    - finished_with_summary(summary_dict) en fin de batch
+    - finished_with_error(message) en cas d'erreur fatale (rare,
+      les erreurs par-commande sont collectees dans summary['errors'])
+    """
+    progress = pyqtSignal(int, int, str)
+    finished_with_summary = pyqtSignal(dict)
+    finished_with_error = pyqtSignal(str)
+
+    def __init__(self, engine: MatchingEngine, cmd_ids: list,
+                 client: DeepSeekClient,
+                 auto_threshold: int = 90,
+                 min_threshold: int = 40,
+                 apply_decisions: bool = True,
+                 use_cache: bool = True,
+                 cancel_check=None,
+                 parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.cmd_ids = cmd_ids
+        self.client = client
+        self.auto_threshold = auto_threshold
+        self.min_threshold = min_threshold
+        self.apply_decisions = apply_decisions
+        self.use_cache = use_cache
+        self._external_cancel = cancel_check
+
+    def run(self):
+        try:
+            summary = self.engine.batch_ai_match(
+                self.cmd_ids, self.client,
+                auto_threshold=self.auto_threshold,
+                min_threshold=self.min_threshold,
+                apply_decisions=self.apply_decisions,
+                use_cache=self.use_cache,
+                progress_callback=lambda i, n, msg: self.progress.emit(i, n, msg),
+                cancel_check=self._external_cancel,
+            )
+            self.finished_with_summary.emit(summary)
         except Exception as e:
             self.finished_with_error.emit(f"{type(e).__name__}: {e}")
