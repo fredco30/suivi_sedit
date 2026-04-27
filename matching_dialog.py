@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QSettings
+from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QFont
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -32,11 +32,16 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from matching_module import (
+    ACTION_AUTO_DOUBLON,
+    ACTION_AUTO_LINKED,
+    ACTION_IGNORED,
+    ACTION_SUGGESTION,
     DIAG_DOUBLON_PROBABLE,
     DIAG_EN_COURS,
     DIAG_OK,
@@ -44,9 +49,11 @@ from matching_module import (
     DIAG_OUBLI_PROBABLE,
     DIAG_RAPPROCHEMENT_SUGGERE,
     DIAG_RECENT,
+    DeepSeekClient,
     LinkRepository,
     MatchingEngine,
     SEVERITE_BY_DIAG,
+    apply_ai_decision,
 )
 
 
@@ -161,6 +168,9 @@ class MatchingDialog(QDialog):
         self.current_cmd_id: Optional[int] = None
         # Cache des donnees commandes affichees, pour filtrage sans re-requeter
         self._all_rows: list[dict] = []
+        # Etat IA
+        self._last_ai_response: Optional[dict] = None
+        self._ai_worker: Optional["AiWorker"] = None
 
         self.setWindowTitle("Assistant de rapprochement commandes ↔ factures")
         self.resize(1400, 850)
@@ -351,6 +361,35 @@ class MatchingDialog(QDialog):
         l_layout.addWidget(self.link_table)
         v.addWidget(gb_links)
 
+        # Bloc Avis IA (visible mais inactif si pas de cle API configuree)
+        self.gb_ai = QGroupBox("Avis IA")
+        ai_layout = QVBoxLayout(self.gb_ai)
+        ai_header = QHBoxLayout()
+        self.ai_diag_label = QLabel("Pas encore consulte.")
+        self.ai_diag_label.setStyleSheet("font-weight: bold;")
+        self.ai_cache_label = QLabel("")
+        self.ai_cache_label.setStyleSheet("color: #888; font-style: italic;")
+        ai_header.addWidget(self.ai_diag_label)
+        ai_header.addWidget(self.ai_cache_label)
+        ai_header.addStretch(1)
+        self.btn_ai_apply = QPushButton("Appliquer la suggestion auto")
+        self.btn_ai_apply.setEnabled(False)
+        self.btn_ai_apply.clicked.connect(self._on_apply_ai_clicked)
+        self.btn_ai_refresh = QPushButton("Forcer un nouvel appel IA")
+        self.btn_ai_refresh.setEnabled(False)
+        self.btn_ai_refresh.clicked.connect(lambda: self._on_ai_clicked(use_cache=False))
+        ai_header.addWidget(self.btn_ai_refresh)
+        ai_header.addWidget(self.btn_ai_apply)
+        ai_layout.addLayout(ai_header)
+        self.ai_reasoning_text = QTextEdit()
+        self.ai_reasoning_text.setReadOnly(True)
+        self.ai_reasoning_text.setMaximumHeight(100)
+        self.ai_reasoning_text.setPlaceholderText(
+            "Cliquez sur 'Demander avis IA' pour analyser cette commande."
+        )
+        ai_layout.addWidget(self.ai_reasoning_text)
+        v.addWidget(self.gb_ai)
+
         # Boutons d'action
         actions_row = QHBoxLayout()
         self.btn_validate = QPushButton("✓ Valider sélection")
@@ -372,10 +411,7 @@ class MatchingDialog(QDialog):
         self.btn_no_match.clicked.connect(self._on_no_match_clicked)
 
         self.btn_ai = QPushButton("🤖 Demander avis IA")
-        self.btn_ai.setEnabled(False)
-        self.btn_ai.setToolTip(
-            "Configurer la cle API DeepSeek (etape 4) pour activer l'assistance IA"
-        )
+        self.btn_ai.clicked.connect(lambda: self._on_ai_clicked(use_cache=True))
 
         for btn in (self.btn_validate, self.btn_doublon, self.btn_no_match, self.btn_ai):
             btn.setEnabled(False)
@@ -572,8 +608,19 @@ class MatchingDialog(QDialog):
         self.details_label.setText("Sélectionnez une commande à gauche.")
         self.cand_table.setRowCount(0)
         self.link_table.setRowCount(0)
-        for btn in (self.btn_validate, self.btn_doublon, self.btn_no_match):
+        for btn in (self.btn_validate, self.btn_doublon, self.btn_no_match,
+                    self.btn_ai, self.btn_ai_apply, self.btn_ai_refresh):
             btn.setEnabled(False)
+        self._clear_ai_panel()
+
+    def _clear_ai_panel(self):
+        self._last_ai_response = None
+        self.ai_diag_label.setText("Pas encore consulte.")
+        self.ai_diag_label.setStyleSheet("font-weight: bold;")
+        self.ai_cache_label.setText("")
+        self.ai_reasoning_text.clear()
+        self.btn_ai_apply.setEnabled(False)
+        self.btn_ai_apply.setText("Appliquer la suggestion auto")
 
     def _refresh_right_panel(self, cmd_id: int):
         cur = self.db.conn.cursor()
@@ -621,6 +668,23 @@ class MatchingDialog(QDialog):
         self.btn_validate.setEnabled(has_candidates and not is_doublon)
         self.btn_doublon.setEnabled(not is_doublon)
         self.btn_no_match.setEnabled(True)
+
+        # Bouton IA : enabled si configure et candidats presents
+        ai_ready = self._is_ai_configured()
+        self.btn_ai.setEnabled(ai_ready and has_candidates)
+        if not ai_ready:
+            self.btn_ai.setToolTip(
+                "Configurer la cle API DeepSeek dans Configuration / Onglet IA"
+            )
+        elif not has_candidates:
+            self.btn_ai.setToolTip("Aucun candidat a analyser")
+        else:
+            self.btn_ai.setToolTip(
+                "Lance une analyse IA des factures candidates pour cette commande"
+            )
+
+        # Charger le cache IA si present
+        self._load_cached_ai_response(cmd_id)
 
     def _fill_candidates_table(self, candidates: list, cmd_d: dict):
         self.cand_table.setRowCount(0)
@@ -871,6 +935,239 @@ class MatchingDialog(QDialog):
                 return
 
     # ------------------------------------------------------------------
+    # IA : configuration, appel asynchrone, application de la decision
+    # ------------------------------------------------------------------
+
+    def _is_ai_configured(self) -> bool:
+        api_key = self.db.get_config("deepseek_api_key", "") or ""
+        enabled = self.db.get_config("ai_enabled", "0") == "1"
+        return bool(api_key.strip()) and enabled
+
+    def _build_ai_client(self) -> Optional[DeepSeekClient]:
+        api_key = (self.db.get_config("deepseek_api_key", "") or "").strip()
+        if not api_key:
+            return None
+        model = self.db.get_config("deepseek_model", "deepseek-chat") or "deepseek-chat"
+        endpoint = (self.db.get_config(
+            "deepseek_endpoint",
+            "https://api.deepseek.com/v1/chat/completions",
+        ) or "https://api.deepseek.com/v1/chat/completions")
+        return DeepSeekClient(api_key=api_key, model=model, endpoint=endpoint, timeout=30)
+
+    def _load_cached_ai_response(self, cmd_id: int):
+        cur = self.db.conn.cursor()
+        cur.execute(
+            "SELECT last_ai_diagnostic, last_ai_check_at FROM commande_diagnostic "
+            "WHERE commande_id = ?",
+            (cmd_id,),
+        )
+        row = cur.fetchone()
+        if not row or not row["last_ai_diagnostic"]:
+            return
+        try:
+            import json as _json
+            data = _json.loads(row["last_ai_diagnostic"])
+            data["_from_cache"] = True
+        except Exception:
+            return
+        self._display_ai_response(data, cached_at=row["last_ai_check_at"])
+
+    def _on_ai_clicked(self, use_cache: bool = True):
+        if self.current_cmd_id is None:
+            return
+        if self._ai_worker is not None and self._ai_worker.isRunning():
+            QMessageBox.information(
+                self, "IA en cours",
+                "Un appel IA est deja en cours, attendez sa fin."
+            )
+            return
+        client = self._build_ai_client()
+        if client is None:
+            QMessageBox.warning(
+                self, "IA non configuree",
+                "Configurer la cle API DeepSeek dans Configuration / Onglet IA."
+            )
+            return
+        candidates = self.engine.find_candidates(self.current_cmd_id)
+        if not candidates:
+            QMessageBox.information(
+                self, "Aucun candidat",
+                "Pas de facture candidate a analyser."
+            )
+            return
+
+        # UI : feedback debut
+        self._set_ai_busy(True)
+        self.status_label.setText("Appel IA en cours...")
+        self.ai_diag_label.setText("Analyse en cours...")
+        self.ai_diag_label.setStyleSheet("font-weight: bold; color: #555;")
+        self.ai_reasoning_text.setPlainText("")
+
+        worker = AiWorker(self.engine, self.current_cmd_id,
+                          candidates, client, use_cache)
+        worker.finished_with_response.connect(self._on_ai_response)
+        worker.finished_with_error.connect(self._on_ai_error)
+        # Auto-cleanup
+        worker.finished.connect(lambda: setattr(self, "_ai_worker", None))
+        self._ai_worker = worker
+        worker.start()
+
+    def _on_ai_response(self, response: dict):
+        self._set_ai_busy(False)
+        self._display_ai_response(response)
+        cached = response.get("_from_cache", False)
+        self.status_label.setText(
+            "Reponse IA recuperee depuis le cache."
+            if cached else "Reponse IA recue."
+        )
+
+    def _on_ai_error(self, message: str):
+        self._set_ai_busy(False)
+        self.ai_diag_label.setText("Erreur IA")
+        self.ai_diag_label.setStyleSheet("font-weight: bold; color: #b00020;")
+        self.ai_reasoning_text.setPlainText(message)
+        self.status_label.setText("Erreur lors de l'appel IA.")
+        QMessageBox.critical(self, "Erreur IA",
+                             f"L'appel a l'API DeepSeek a echoue :\n\n{message}")
+
+    def _set_ai_busy(self, busy: bool):
+        self.btn_ai.setEnabled(not busy)
+        self.btn_ai_refresh.setEnabled(not busy and self._last_ai_response is not None)
+        self.btn_ai_apply.setEnabled(not busy and self._can_apply_ai_decision())
+
+    def _can_apply_ai_decision(self) -> bool:
+        if not self._last_ai_response:
+            return False
+        try:
+            auto_thr = int(self.db.get_config("ai_auto_threshold", "90") or 90)
+        except (TypeError, ValueError):
+            auto_thr = 90
+        confidence = int(self._last_ai_response.get("confidence", 0))
+        action = self._last_ai_response.get("action_suggeree")
+        diag = self._last_ai_response.get("diagnostic")
+        if confidence < auto_thr:
+            return False
+        if diag == "DOUBLON" and action == "MARQUER_DOUBLON":
+            return True
+        if diag in ("MATCH", "PARTIEL") and action == "VALIDER_AUTO":
+            return True
+        return False
+
+    def _display_ai_response(self, response: dict, cached_at: Optional[str] = None):
+        self._last_ai_response = response
+        diag = response.get("diagnostic", "?")
+        confidence = response.get("confidence", 0)
+        action = response.get("action_suggeree", "?")
+        reasoning = response.get("raisonnement", "")
+
+        # Colorer selon diagnostic + confiance
+        color = "#555"
+        if diag == "DOUBLON":
+            color = "#b25400"
+        elif diag == "MATCH":
+            color = "#1b7e2c"
+        elif diag == "PARTIEL":
+            color = "#996800"
+        elif diag == "ORPHELINE":
+            color = "#b00020"
+        self.ai_diag_label.setStyleSheet(f"font-weight: bold; color: {color};")
+        self.ai_diag_label.setText(
+            f"{diag} — confiance {confidence}% — action suggeree : {action}"
+        )
+        if response.get("_from_cache") or cached_at:
+            stamp = cached_at or "cache"
+            self.ai_cache_label.setText(f"(cache : {stamp[:19]})")
+        else:
+            self.ai_cache_label.setText("")
+
+        self.ai_reasoning_text.setPlainText(reasoning)
+
+        # Pre-cocher les factures suggerees + remplir leurs montants
+        suggested = response.get("factures_a_lier") or []
+        self._apply_ai_suggestions_to_candidates(suggested)
+
+        # Bouton applique uniquement si confidence >= auto_threshold + action coherente
+        self.btn_ai_apply.setEnabled(self._can_apply_ai_decision())
+        self.btn_ai_apply.setText(self._apply_button_label(diag, action))
+        self.btn_ai_refresh.setEnabled(True)
+
+    def _apply_button_label(self, diag: str, action: str) -> str:
+        if action == "MARQUER_DOUBLON":
+            return "Marquer doublon (auto)"
+        if action == "VALIDER_AUTO":
+            return "Creer les liens (auto)"
+        return "Appliquer la suggestion auto"
+
+    def _apply_ai_suggestions_to_candidates(self, suggested: list):
+        if not suggested:
+            return
+        # Map code_mouvement -> (montant_alloue suggere)
+        by_code = {}
+        for s in suggested:
+            code = (s.get("code_mouvement") or "").strip()
+            if not code:
+                continue
+            try:
+                m = float(s.get("montant_alloue") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            by_code[code] = m
+
+        for i in range(self.cand_table.rowCount()):
+            code_item = self.cand_table.item(i, self.CC_CODE_MVT)
+            if code_item is None:
+                continue
+            code = code_item.text().strip()
+            if code in by_code:
+                chk = self.cand_table.item(i, self.CC_CHECK)
+                if chk is not None:
+                    chk.setCheckState(Qt.Checked)
+                spin = self.cand_table.cellWidget(i, self.CC_ALLOUE)
+                if spin is not None and by_code[code] > 0:
+                    # Cap au max du spinbox
+                    spin.setValue(min(by_code[code], spin.maximum()))
+
+    def _on_apply_ai_clicked(self):
+        if self.current_cmd_id is None or not self._last_ai_response:
+            return
+        try:
+            auto_thr = int(self.db.get_config("ai_auto_threshold", "90") or 90)
+            min_thr = int(self.db.get_config("ai_min_threshold", "40") or 40)
+        except (TypeError, ValueError):
+            auto_thr, min_thr = 90, 40
+
+        ans = QMessageBox.question(
+            self, "Confirmer",
+            f"Appliquer la decision IA ?\n\n"
+            f"Diagnostic : {self._last_ai_response.get('diagnostic')}\n"
+            f"Confiance : {self._last_ai_response.get('confidence')}%\n"
+            f"Action : {self._last_ai_response.get('action_suggeree')}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ans != QMessageBox.Yes:
+            return
+
+        try:
+            result = apply_ai_decision(
+                self.db.conn, self.link_repo,
+                self.current_cmd_id, self._last_ai_response,
+                auto_threshold=auto_thr, min_threshold=min_thr,
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", f"Echec : {e}")
+            return
+
+        msg = {
+            ACTION_AUTO_DOUBLON: "Commande marquee comme doublon administratif (auto IA).",
+            ACTION_AUTO_LINKED: "Liens IA crees automatiquement.",
+            ACTION_SUGGESTION: "Confiance insuffisante pour auto-validation, suggestion enregistree.",
+            ACTION_IGNORED: "Decision IA ignoree (sous le seuil minimum).",
+        }.get(result, f"Resultat : {result}")
+        self.status_label.setText(msg)
+        # Recompute global + refresh
+        self._recompute_after_action()
+
+    # ------------------------------------------------------------------
     # Persistance geometrie
     # ------------------------------------------------------------------
 
@@ -884,9 +1181,46 @@ class MatchingDialog(QDialog):
             pass
 
     def closeEvent(self, event):
+        # Stopper proprement un worker IA en cours
+        if self._ai_worker is not None and self._ai_worker.isRunning():
+            self._ai_worker.wait(2000)
         try:
             settings = QSettings("suivi_sedit", "matching_dialog")
             settings.setValue("geometry", self.saveGeometry())
         except Exception:
             pass
         super().closeEvent(event)
+
+
+# ============================================================================
+# AiWorker : appel asynchrone DeepSeek dans un QThread (UI ne bloque pas)
+# ============================================================================
+
+class AiWorker(QThread):
+    """Encapsule un appel a MatchingEngine.ai_match dans un thread dedie.
+
+    Emet finished_with_response(dict) en cas de succes, ou
+    finished_with_error(str) en cas d'erreur.
+    """
+    finished_with_response = pyqtSignal(dict)
+    finished_with_error = pyqtSignal(str)
+
+    def __init__(self, engine: MatchingEngine, commande_id: int,
+                 candidates: list, client: DeepSeekClient,
+                 use_cache: bool = True, parent=None):
+        super().__init__(parent)
+        self.engine = engine
+        self.commande_id = commande_id
+        self.candidates = candidates
+        self.client = client
+        self.use_cache = use_cache
+
+    def run(self):
+        try:
+            response = self.engine.ai_match(
+                self.commande_id, self.candidates, self.client,
+                use_cache=self.use_cache,
+            )
+            self.finished_with_response.emit(response)
+        except Exception as e:
+            self.finished_with_error.emit(f"{type(e).__name__}: {e}")

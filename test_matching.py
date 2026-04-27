@@ -42,6 +42,7 @@ CREATE TABLE commandes (
     libelle TEXT,
     date_commande TEXT,
     marche TEXT,
+    service_emetteur TEXT,
     montant_ttc REAL,
     statut TEXT,
     statut_facturation TEXT,
@@ -87,7 +88,10 @@ CREATE TABLE commande_diagnostic (
     montant_candidates_total REAL DEFAULT 0,
     last_ai_check_at TEXT,
     last_ai_diagnostic TEXT,
-    last_diagnostic_at TEXT NOT NULL
+    last_diagnostic_at TEXT NOT NULL,
+    notes TEXT,
+    dismissed_until TEXT,
+    last_ai_candidates_hash TEXT
 );
 """
 
@@ -522,6 +526,419 @@ class TestDiagnoseAllCommandes(unittest.TestCase):
         diag = self._diag_for(cmd_id)
         self.assertEqual(diag["last_ai_check_at"], "2025-05-30T10:00:00")
         self.assertEqual(diag["last_ai_diagnostic"], '{"diagnostic": "ORPHELINE"}')
+
+
+# ============================================================================
+# Tests etape 4 : DeepSeekClient + ai_match + apply_ai_decision
+# ============================================================================
+
+from unittest.mock import patch, MagicMock
+from matching_module import (
+    AI_VALID_DIAGNOSTICS,
+    ACTION_AUTO_DOUBLON,
+    ACTION_AUTO_LINKED,
+    ACTION_IGNORED,
+    ACTION_SUGGESTION,
+    DeepSeekClient,
+    apply_ai_decision,
+    build_ai_user_prompt,
+    compute_candidates_hash,
+    validate_ai_response,
+)
+
+
+class TestParseJsonResponse(unittest.TestCase):
+    def test_clean_json(self):
+        out = DeepSeekClient.parse_json_response('{"a": 1, "b": [2, 3]}')
+        self.assertEqual(out, {"a": 1, "b": [2, 3]})
+
+    def test_with_fences(self):
+        text = "```json\n{\"diagnostic\": \"DOUBLON\", \"confidence\": 92}\n```"
+        out = DeepSeekClient.parse_json_response(text)
+        self.assertEqual(out["diagnostic"], "DOUBLON")
+        self.assertEqual(out["confidence"], 92)
+
+    def test_with_fences_no_lang(self):
+        out = DeepSeekClient.parse_json_response("```\n{\"x\": true}\n```")
+        self.assertEqual(out, {"x": True})
+
+    def test_with_preamble(self):
+        text = 'Voici la reponse :\n{"a": 1}\nFin.'
+        out = DeepSeekClient.parse_json_response(text)
+        self.assertEqual(out, {"a": 1})
+
+    def test_nested_objects(self):
+        text = 'Note:\n{"outer": {"inner": "value"}, "list": [{"k": 1}]}'
+        out = DeepSeekClient.parse_json_response(text)
+        self.assertEqual(out["outer"]["inner"], "value")
+
+    def test_braces_in_strings(self):
+        # Le parseur ne doit pas considerer les { dans une string comme un nesting
+        text = '{"sql": "SELECT * FROM t WHERE c = \\"{a}\\"", "ok": true}'
+        out = DeepSeekClient.parse_json_response(text)
+        self.assertTrue(out["ok"])
+
+    def test_malformed_raises(self):
+        with self.assertRaises(ValueError):
+            DeepSeekClient.parse_json_response("pas du tout du json")
+
+    def test_empty_raises(self):
+        with self.assertRaises(ValueError):
+            DeepSeekClient.parse_json_response("")
+        with self.assertRaises(ValueError):
+            DeepSeekClient.parse_json_response("   ")
+
+
+class TestValidateAiResponse(unittest.TestCase):
+    BASE = {
+        "diagnostic": "MATCH",
+        "confidence": 80,
+        "factures_a_lier": [],
+        "raisonnement": "ok",
+        "action_suggeree": "VALIDER_MANUEL",
+    }
+
+    def test_ok(self):
+        validate_ai_response(self.BASE)  # ne raise pas
+
+    def test_missing_key(self):
+        bad = dict(self.BASE)
+        del bad["confidence"]
+        with self.assertRaises(ValueError):
+            validate_ai_response(bad)
+
+    def test_invalid_diagnostic(self):
+        bad = dict(self.BASE, diagnostic="MAYBE")
+        with self.assertRaises(ValueError):
+            validate_ai_response(bad)
+
+    def test_invalid_action(self):
+        bad = dict(self.BASE, action_suggeree="DELETE_DB")
+        with self.assertRaises(ValueError):
+            validate_ai_response(bad)
+
+    def test_confidence_out_of_range(self):
+        bad = dict(self.BASE, confidence=150)
+        with self.assertRaises(ValueError):
+            validate_ai_response(bad)
+
+    def test_factures_a_lier_must_be_list(self):
+        bad = dict(self.BASE, factures_a_lier="oops")
+        with self.assertRaises(ValueError):
+            validate_ai_response(bad)
+
+
+class TestComputeCandidatesHash(unittest.TestCase):
+    def test_stable_order(self):
+        a = [{"code_mouvement": "25AA00079"}, {"code_mouvement": "25AA00077"}]
+        b = [{"code_mouvement": "25AA00077"}, {"code_mouvement": "25AA00079"}]
+        self.assertEqual(compute_candidates_hash(a), compute_candidates_hash(b))
+
+    def test_differs_on_change(self):
+        a = [{"code_mouvement": "25AA00077"}]
+        b = [{"code_mouvement": "25AA00078"}]
+        self.assertNotEqual(compute_candidates_hash(a), compute_candidates_hash(b))
+
+    def test_empty_list(self):
+        # Un hash stable, non vide
+        h = compute_candidates_hash([])
+        self.assertIsInstance(h, str)
+        self.assertEqual(len(h), 16)
+
+
+class TestBuildAiUserPrompt(unittest.TestCase):
+    def test_includes_commande_fields(self):
+        cmd = {
+            "num_commande": "25AA01486",
+            "fournisseur": "ACAF",
+            "marche": "2023_17",
+            "service_emetteur": "DSTBATI",
+            "montant_ttc": 2376.0,
+            "reste_a_facturer": 2376.0,
+            "libelle": "Maintenance ascenseurs",
+            "date_commande": "2025-04-28",
+        }
+        candidates = [
+            {"id": 1, "num_facture": "F1", "code_mouvement": "25AA00079",
+             "fournisseur": "ACAF", "marche": "2023_17",
+             "date_facture": "2025-01-13", "montant_service_fait": 696.94,
+             "libelle": "MAINTENANCE PALAIS SPORTS"},
+        ]
+        prompt = build_ai_user_prompt(cmd, candidates)
+        self.assertIn("25AA01486", prompt)
+        self.assertIn("ACAF", prompt)
+        self.assertIn("2023_17", prompt)
+        self.assertIn("25AA00079", prompt)
+        self.assertIn("MAINTENANCE PALAIS SPORTS", prompt)
+        self.assertIn("DSTBATI", prompt)
+        # Montant formate avec 2 decimales
+        self.assertIn("2376.00", prompt)
+
+
+class TestDeepSeekClientChat(unittest.TestCase):
+    """Tests de DeepSeekClient.chat avec urlopen mocke."""
+
+    def setUp(self):
+        self.client = DeepSeekClient(
+            api_key="sk-test", model="deepseek-chat",
+            endpoint="https://api.example.com/v1/chat/completions",
+            timeout=2,
+        )
+
+    def _mock_response(self, content_text, status=200):
+        """Construit un mock de la reponse urlopen."""
+        body = {
+            "choices": [{"message": {"content": content_text}}]
+        }
+        import json as _json
+        raw = _json.dumps(body).encode("utf-8")
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = raw
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = lambda s, *a: False
+        return mock_resp
+
+    def test_chat_success(self):
+        with patch("urllib.request.urlopen") as urlopen:
+            urlopen.return_value = self._mock_response('{"diagnostic":"MATCH"}')
+            out = self.client.chat("sys", "user")
+        self.assertEqual(out, '{"diagnostic":"MATCH"}')
+
+    def test_chat_4xx_no_retry(self):
+        import urllib.error as _ue
+        with patch("urllib.request.urlopen") as urlopen:
+            err = _ue.HTTPError("u", 401, "Unauthorized", {}, None)
+            err.read = lambda: b'{"error":"invalid api key"}'
+            urlopen.side_effect = err
+            with self.assertRaises(RuntimeError) as ctx:
+                self.client.chat("sys", "user")
+            self.assertIn("401", str(ctx.exception))
+            # Pas de retry sur 4xx : un seul appel
+            self.assertEqual(urlopen.call_count, 1)
+
+    def test_chat_retries_on_5xx(self):
+        import urllib.error as _ue
+        with patch("urllib.request.urlopen") as urlopen, \
+             patch("matching_module.time.sleep"):
+            err = _ue.HTTPError("u", 503, "Unavailable", {}, None)
+            err.read = lambda: b''
+            urlopen.side_effect = [err, err, self._mock_response('{"x":1}')]
+            out = self.client.chat("sys", "user")
+        self.assertEqual(out, '{"x":1}')
+        self.assertEqual(urlopen.call_count, 3)
+
+    def test_chat_retries_then_fails(self):
+        import urllib.error as _ue
+        with patch("urllib.request.urlopen") as urlopen, \
+             patch("matching_module.time.sleep"):
+            urlopen.side_effect = _ue.URLError("network down")
+            with self.assertRaises(RuntimeError):
+                self.client.chat("sys", "user")
+            self.assertEqual(urlopen.call_count, 3)
+
+
+class TestAiMatchCache(unittest.TestCase):
+    """Tests de MatchingEngine.ai_match avec un client mocke."""
+
+    def setUp(self):
+        self.conn = make_db()
+        self.repo = LinkRepository(self.conn)
+        # today fixe pour deterministe
+        self.engine = MatchingEngine(self.conn, self.repo, today=date(2025, 6, 1))
+
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO commandes (num_commande, fournisseur, libelle, "
+            "date_commande, marche, montant_ttc, reste_a_facturer) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("25AA01486", "ACAF", "Maintenance ascenseurs",
+             "2025-04-28", "2023_17", 2376.0, 2376.0),
+        )
+        self.cmd_id = cur.lastrowid
+        self.conn.commit()
+
+        self.candidates = [
+            {"id": 1, "num_facture": "F77", "code_mouvement": "25AA00077",
+             "fournisseur": "ACAF", "marche": "2023_17",
+             "date_facture": "2025-01-13", "montant_service_fait": 373.37,
+             "libelle": "MAINT BIBLIO"},
+        ]
+
+        self.fake_response = {
+            "diagnostic": "DOUBLON",
+            "confidence": 92,
+            "factures_a_lier": [],
+            "raisonnement": "Doublon administratif probable",
+            "action_suggeree": "MARQUER_DOUBLON",
+        }
+
+    def _make_client_mock(self):
+        client = MagicMock(spec=DeepSeekClient)
+        import json as _json
+        client.chat.return_value = _json.dumps(self.fake_response)
+        return client
+
+    def test_first_call_hits_api_and_caches(self):
+        client = self._make_client_mock()
+        out = self.engine.ai_match(self.cmd_id, self.candidates, client)
+        self.assertEqual(out["diagnostic"], "DOUBLON")
+        self.assertFalse(out["_from_cache"])
+        client.chat.assert_called_once()
+        # Persiste
+        cur = self.conn.cursor()
+        cur.execute("SELECT last_ai_diagnostic, last_ai_candidates_hash "
+                    "FROM commande_diagnostic WHERE commande_id = ?",
+                    (self.cmd_id,))
+        row = cur.fetchone()
+        self.assertIsNotNone(row)
+        self.assertIn("DOUBLON", row["last_ai_diagnostic"])
+        self.assertEqual(row["last_ai_candidates_hash"],
+                         compute_candidates_hash(self.candidates))
+
+    def test_second_call_uses_cache(self):
+        client = self._make_client_mock()
+        self.engine.ai_match(self.cmd_id, self.candidates, client)
+        # Second appel : meme candidats, dans la fenetre de freshness
+        out2 = self.engine.ai_match(self.cmd_id, self.candidates, client)
+        self.assertTrue(out2["_from_cache"])
+        # API appelee une seule fois
+        self.assertEqual(client.chat.call_count, 1)
+
+    def test_cache_invalidated_when_candidates_change(self):
+        client = self._make_client_mock()
+        self.engine.ai_match(self.cmd_id, self.candidates, client)
+        # Nouveau candidat -> hash different
+        new_cands = self.candidates + [
+            {"id": 2, "num_facture": "F78", "code_mouvement": "25AA00078",
+             "fournisseur": "ACAF", "marche": "2023_17",
+             "date_facture": "2025-01-13", "montant_service_fait": 1393.88,
+             "libelle": "MAINT MAIRIE"},
+        ]
+        self.engine.ai_match(self.cmd_id, new_cands, client)
+        self.assertEqual(client.chat.call_count, 2)
+
+    def test_cache_invalidated_when_stale(self):
+        client = self._make_client_mock()
+        self.engine.ai_match(self.cmd_id, self.candidates, client)
+        # On vieillit le cache de 30 jours
+        cur = self.conn.cursor()
+        old_iso = (datetime(2025, 5, 1, 10, 0, 0)).isoformat(timespec="seconds")
+        cur.execute("UPDATE commande_diagnostic SET last_ai_check_at = ? "
+                    "WHERE commande_id = ?", (old_iso, self.cmd_id))
+        self.conn.commit()
+        self.engine.ai_match(self.cmd_id, self.candidates, client, max_age_days=7)
+        self.assertEqual(client.chat.call_count, 2)
+
+    def test_use_cache_false_forces_api_call(self):
+        client = self._make_client_mock()
+        self.engine.ai_match(self.cmd_id, self.candidates, client)
+        self.engine.ai_match(self.cmd_id, self.candidates, client, use_cache=False)
+        self.assertEqual(client.chat.call_count, 2)
+
+    def test_invalid_response_raises(self):
+        client = MagicMock(spec=DeepSeekClient)
+        client.chat.return_value = '{"diagnostic": "INVALID_VALUE"}'
+        with self.assertRaises(ValueError):
+            self.engine.ai_match(self.cmd_id, self.candidates, client)
+
+
+class TestApplyAiDecision(unittest.TestCase):
+    def setUp(self):
+        self.conn = make_db()
+        self.repo = LinkRepository(self.conn)
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO commandes (num_commande, fournisseur, montant_ttc, "
+            "reste_a_facturer) VALUES (?, ?, ?, ?)",
+            ("25AA01486", "ACAF", 2376.0, 2376.0),
+        )
+        self.cmd_id = cur.lastrowid
+        cur.execute(
+            "INSERT INTO factures (num_facture, code_mouvement, fournisseur, "
+            "date_facture, montant_service_fait) VALUES (?, ?, ?, ?, ?)",
+            ("F79", "25AA00079", "ACAF", "2025-01-13", 696.94),
+        )
+        self.fact_id = cur.lastrowid
+        self.conn.commit()
+
+    def test_auto_doublon_applied(self):
+        ai = {
+            "diagnostic": "DOUBLON",
+            "confidence": 95,
+            "factures_a_lier": [],
+            "raisonnement": "Doublon admin",
+            "action_suggeree": "MARQUER_DOUBLON",
+        }
+        action = apply_ai_decision(self.conn, self.repo, self.cmd_id, ai,
+                                   auto_threshold=90, min_threshold=40)
+        self.assertEqual(action, ACTION_AUTO_DOUBLON)
+        cur = self.conn.cursor()
+        cur.execute("SELECT statut_metier FROM commandes WHERE id = ?", (self.cmd_id,))
+        self.assertEqual(cur.fetchone()["statut_metier"], "DOUBLON_ADMIN")
+
+    def test_auto_doublon_below_threshold_returns_suggestion(self):
+        ai = {
+            "diagnostic": "DOUBLON",
+            "confidence": 60,
+            "factures_a_lier": [],
+            "raisonnement": "Possible doublon",
+            "action_suggeree": "MARQUER_DOUBLON",
+        }
+        action = apply_ai_decision(self.conn, self.repo, self.cmd_id, ai,
+                                   auto_threshold=90, min_threshold=40)
+        self.assertEqual(action, ACTION_SUGGESTION)
+        cur = self.conn.cursor()
+        cur.execute("SELECT statut_metier FROM commandes WHERE id = ?", (self.cmd_id,))
+        self.assertIsNone(cur.fetchone()["statut_metier"])
+
+    def test_auto_link_creates_manual_link(self):
+        ai = {
+            "diagnostic": "MATCH",
+            "confidence": 95,
+            "factures_a_lier": [
+                {"code_mouvement": "25AA00079",
+                 "montant_alloue": 500.0,
+                 "raison": "match marche"},
+            ],
+            "raisonnement": "Match clair",
+            "action_suggeree": "VALIDER_AUTO",
+        }
+        action = apply_ai_decision(self.conn, self.repo, self.cmd_id, ai,
+                                   auto_threshold=90, min_threshold=40)
+        self.assertEqual(action, ACTION_AUTO_LINKED)
+        links = self.repo.list_links_for_commande(self.cmd_id)
+        self.assertEqual(len(links), 1)
+        self.assertEqual(links[0]["facture_id"], self.fact_id)
+        self.assertEqual(links[0]["source"], "ai_auto")
+        self.assertEqual(links[0]["confidence"], 95)
+        self.assertAlmostEqual(links[0]["montant_alloue"], 500.0, places=2)
+
+    def test_auto_link_skips_unknown_code_mouvement(self):
+        ai = {
+            "diagnostic": "MATCH",
+            "confidence": 95,
+            "factures_a_lier": [
+                {"code_mouvement": "ZZINEXISTANT",
+                 "montant_alloue": 100.0, "raison": "?"},
+            ],
+            "raisonnement": "Match", "action_suggeree": "VALIDER_AUTO",
+        }
+        action = apply_ai_decision(self.conn, self.repo, self.cmd_id, ai,
+                                   auto_threshold=90, min_threshold=40)
+        self.assertEqual(action, ACTION_AUTO_LINKED)
+        # Aucun lien cree car le code n'existe pas
+        self.assertEqual(self.repo.list_links_for_commande(self.cmd_id), [])
+
+    def test_below_min_threshold_ignored(self):
+        ai = {
+            "diagnostic": "INDETERMINE",
+            "confidence": 20,
+            "factures_a_lier": [],
+            "raisonnement": "?", "action_suggeree": "INVESTIGUER",
+        }
+        action = apply_ai_decision(self.conn, self.repo, self.cmd_id, ai,
+                                   auto_threshold=90, min_threshold=40)
+        self.assertEqual(action, ACTION_IGNORED)
 
 
 if __name__ == "__main__":

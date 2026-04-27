@@ -593,6 +593,14 @@ class Database:
             cur.execute("ALTER TABLE commande_diagnostic ADD COLUMN dismissed_until TEXT")
             self.conn.commit()
 
+        # Migration: ajouter last_ai_candidates_hash a commande_diagnostic (cache IA etape 4)
+        try:
+            cur.execute("SELECT last_ai_candidates_hash FROM commande_diagnostic LIMIT 1")
+        except sqlite3.OperationalError:
+            print("[MIGRATION] Ajout de la colonne commande_diagnostic.last_ai_candidates_hash")
+            cur.execute("ALTER TABLE commande_diagnostic ADD COLUMN last_ai_candidates_hash TEXT")
+            self.conn.commit()
+
         self.conn.commit()
 
     # -------------- Config --------------
@@ -2236,6 +2244,87 @@ class ConfigDialog(QDialog):
         
         tabs.addTab(tab_exports, "Exports")
 
+        # ===== Onglet IA (DeepSeek) =====
+        tab_ia = QWidget()
+        form_ia = QFormLayout(tab_ia)
+
+        self.ia_enabled_check = QCheckBox("Activer l'assistance IA pour le rapprochement")
+        self.ia_enabled_check.setChecked(self.db.get_config("ai_enabled", "0") == "1")
+        form_ia.addRow(self.ia_enabled_check)
+
+        self.ia_api_key_edit = QLineEdit(self.db.get_config("deepseek_api_key", "") or "")
+        self.ia_api_key_edit.setEchoMode(QLineEdit.Password)
+        self.ia_api_key_edit.setPlaceholderText("sk-...")
+        form_ia.addRow("Clé API DeepSeek :", self.ia_api_key_edit)
+
+        self.ia_show_key_btn = QPushButton("Afficher")
+        self.ia_show_key_btn.setCheckable(True)
+
+        def _toggle_show_key(checked):
+            self.ia_api_key_edit.setEchoMode(
+                QLineEdit.Normal if checked else QLineEdit.Password
+            )
+            self.ia_show_key_btn.setText("Masquer" if checked else "Afficher")
+
+        self.ia_show_key_btn.toggled.connect(_toggle_show_key)
+        form_ia.addRow("", self.ia_show_key_btn)
+
+        self.ia_model_combo = QComboBox()
+        self.ia_model_combo.setEditable(True)
+        for m in ("deepseek-chat", "deepseek-reasoner"):
+            self.ia_model_combo.addItem(m)
+        current_model = self.db.get_config("deepseek_model", "deepseek-chat") or "deepseek-chat"
+        idx = self.ia_model_combo.findText(current_model)
+        if idx >= 0:
+            self.ia_model_combo.setCurrentIndex(idx)
+        else:
+            self.ia_model_combo.setCurrentText(current_model)
+        form_ia.addRow("Modèle :", self.ia_model_combo)
+
+        self.ia_endpoint_edit = QLineEdit(
+            self.db.get_config("deepseek_endpoint",
+                               "https://api.deepseek.com/v1/chat/completions")
+            or "https://api.deepseek.com/v1/chat/completions"
+        )
+        form_ia.addRow("Endpoint :", self.ia_endpoint_edit)
+
+        self.ia_auto_threshold_spin = QSpinBox()
+        self.ia_auto_threshold_spin.setRange(0, 100)
+        self.ia_auto_threshold_spin.setSuffix(" %")
+        try:
+            self.ia_auto_threshold_spin.setValue(int(self.db.get_config("ai_auto_threshold", "90")))
+        except (TypeError, ValueError):
+            self.ia_auto_threshold_spin.setValue(90)
+        self.ia_auto_threshold_spin.setToolTip(
+            "Seuil de confiance au-dessus duquel l'IA peut auto-valider un rapprochement ou un doublon"
+        )
+        form_ia.addRow("Seuil auto-validation :", self.ia_auto_threshold_spin)
+
+        self.ia_min_threshold_spin = QSpinBox()
+        self.ia_min_threshold_spin.setRange(0, 100)
+        self.ia_min_threshold_spin.setSuffix(" %")
+        try:
+            self.ia_min_threshold_spin.setValue(int(self.db.get_config("ai_min_threshold", "40")))
+        except (TypeError, ValueError):
+            self.ia_min_threshold_spin.setValue(40)
+        self.ia_min_threshold_spin.setToolTip(
+            "Seuil minimum sous lequel les suggestions IA sont ignorees"
+        )
+        form_ia.addRow("Seuil minimum suggestion :", self.ia_min_threshold_spin)
+
+        info_label = QLabel(
+            "<i>Coût estimé : ~0,02 $ pour analyser 25 commandes problématiques.<br>"
+            "La clé reste stockée localement, n'est jamais incluse dans les exports.</i>"
+        )
+        info_label.setWordWrap(True)
+        form_ia.addRow(info_label)
+
+        self.ia_test_btn = QPushButton("Tester la connexion")
+        self.ia_test_btn.clicked.connect(self._on_test_ia_clicked)
+        form_ia.addRow("", self.ia_test_btn)
+
+        tabs.addTab(tab_ia, "IA")
+
         # Boutons OK/Annuler
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         buttons.accepted.connect(self.accept)
@@ -2285,8 +2374,55 @@ class ConfigDialog(QDialog):
             "lignes_filtrees_uniquement": self.lignes_filtrees_check.isChecked()
         }
         self.db.save_config_exports(config_exp)
-        
+
+        # Sauvegarder config IA
+        self.db.set_config(
+            "ai_enabled", "1" if self.ia_enabled_check.isChecked() else "0"
+        )
+        self.db.set_config("deepseek_api_key", self.ia_api_key_edit.text().strip())
+        self.db.set_config("deepseek_model", self.ia_model_combo.currentText().strip())
+        self.db.set_config("deepseek_endpoint", self.ia_endpoint_edit.text().strip())
+        self.db.set_config("ai_auto_threshold", str(self.ia_auto_threshold_spin.value()))
+        self.db.set_config("ai_min_threshold", str(self.ia_min_threshold_spin.value()))
+
         super().accept()
+
+    def _on_test_ia_clicked(self):
+        api_key = self.ia_api_key_edit.text().strip()
+        if not api_key:
+            QMessageBox.warning(self, "Cle API manquante",
+                                "Renseigne la cle API DeepSeek avant de tester.")
+            return
+        endpoint = self.ia_endpoint_edit.text().strip()
+        model = self.ia_model_combo.currentText().strip()
+        try:
+            from matching_module import DeepSeekClient
+        except ImportError as e:
+            QMessageBox.critical(self, "Module manquant",
+                                 f"Impossible de charger DeepSeekClient :\n{e}")
+            return
+        client = DeepSeekClient(api_key=api_key, model=model, endpoint=endpoint, timeout=15)
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            raw = client.chat(
+                system_prompt="Tu reponds toujours en JSON strict.",
+                user_prompt='Reponds exactement: {"ok": true}',
+                max_tokens=20, temperature=0.0,
+            )
+            parsed = DeepSeekClient.parse_json_response(raw)
+            if parsed.get("ok") is True:
+                QMessageBox.information(self, "Connexion OK",
+                                        "L'API DeepSeek repond correctement.")
+            else:
+                QMessageBox.information(
+                    self, "Connexion OK (reponse inattendue)",
+                    f"L'API a repondu mais pas exactement comme attendu :\n{raw[:200]}",
+                )
+        except Exception as e:
+            QMessageBox.critical(self, "Echec de la connexion",
+                                 f"Erreur lors de l'appel API :\n{e}")
+        finally:
+            QApplication.restoreOverrideCursor()
 
 
 # ------------------ FENETRE PRINCIPALE ------------------

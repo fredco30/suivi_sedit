@@ -1,19 +1,27 @@
 """Module de rapprochement commandes <-> factures.
 
 Couche metier pure : aucune dependance PyQt, testable en isolation.
-Utilise sqlite3 + stdlib uniquement.
+Utilise sqlite3 + stdlib uniquement (urllib pour DeepSeek, pas de requests).
 
 Etape 2 : pre-classification deterministe (sans IA).
 - LinkRepository : CRUD sur la table manual_links.
 - MatchingEngine.find_candidates : pre-filtrage des factures candidates pour une commande.
 - MatchingEngine.diagnose_all_commandes : remplit la table commande_diagnostic.
 
-Les classes DeepSeekClient et MatchingEngine.ai_match sont reservees a l'etape 4.
+Etape 4 : assistance IA via DeepSeek.
+- DeepSeekClient : POST sync avec retry, parse_json_response tolerant.
+- MatchingEngine.ai_match : appel IA avec cache (commande_diagnostic.last_ai_*).
+- apply_ai_decision : applique la decision IA selon les seuils (auto / suggestion).
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sqlite3
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, date, timedelta
 from difflib import SequenceMatcher
 from typing import Optional
@@ -466,3 +474,455 @@ class MatchingEngine:
 
         self.conn.commit()
         return counts
+
+    # ------------------------------------------------------------------
+    # ai_match (etape 4)
+    # ------------------------------------------------------------------
+
+    def ai_match(self, commande_id: int, candidates: list,
+                 client: "DeepSeekClient",
+                 use_cache: bool = True,
+                 max_age_days: int = 7) -> dict:
+        """Interroge l'IA pour analyser une commande et ses candidats.
+
+        Cache : si commande_diagnostic.last_ai_diagnostic existe avec un
+        last_ai_check_at < max_age_days ET le hash candidats identique au
+        last_ai_candidates_hash, retourne le cache sans rappeler l'API.
+
+        Renvoie le dict parse de la reponse IA (cf. spec 7.3 pour la structure).
+        Le dict contient en plus une cle "_from_cache" : bool, et "_raw" : str.
+        """
+        cur = self.conn.cursor()
+
+        cur.execute(
+            "SELECT id, num_commande, fournisseur, marche, service_emetteur, "
+            "montant_ttc, reste_a_facturer, libelle, date_commande "
+            "FROM commandes WHERE id = ?",
+            (commande_id,),
+        )
+        cmd_row = cur.fetchone()
+        if cmd_row is None:
+            raise ValueError(f"commande_id {commande_id} introuvable")
+        cmd = dict(cmd_row)
+
+        cand_hash = compute_candidates_hash(candidates)
+
+        if use_cache:
+            cur.execute(
+                "SELECT last_ai_check_at, last_ai_diagnostic, last_ai_candidates_hash "
+                "FROM commande_diagnostic WHERE commande_id = ?",
+                (commande_id,),
+            )
+            existing = cur.fetchone()
+            if existing and existing["last_ai_diagnostic"] and existing["last_ai_check_at"]:
+                if existing["last_ai_candidates_hash"] == cand_hash:
+                    cached_iso = existing["last_ai_check_at"]
+                    cached_dt = parse_date(cached_iso)
+                    if cached_dt is not None and (self.today - cached_dt).days <= max_age_days:
+                        try:
+                            data = json.loads(existing["last_ai_diagnostic"])
+                            data["_from_cache"] = True
+                            data["_raw"] = existing["last_ai_diagnostic"]
+                            return data
+                        except json.JSONDecodeError:
+                            # Cache corrompu : on ignore et on rappelle l'API
+                            pass
+
+        user_prompt = build_ai_user_prompt(cmd, candidates)
+        raw = client.chat(
+            system_prompt=AI_SYSTEM_PROMPT,
+            user_prompt=user_prompt,
+            max_tokens=900,
+            temperature=0.1,
+        )
+        parsed = DeepSeekClient.parse_json_response(raw)
+        validate_ai_response(parsed)
+
+        # Persist cache (UPSERT : on prend soin de ne pas ecraser les autres champs)
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        payload = json.dumps(parsed, ensure_ascii=False)
+        cur.execute(
+            "SELECT 1 FROM commande_diagnostic WHERE commande_id = ?", (commande_id,)
+        )
+        if cur.fetchone():
+            cur.execute(
+                "UPDATE commande_diagnostic SET last_ai_check_at = ?, "
+                "last_ai_diagnostic = ?, last_ai_candidates_hash = ? "
+                "WHERE commande_id = ?",
+                (now_iso, payload, cand_hash, commande_id),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO commande_diagnostic
+                (commande_id, diagnostic, severite, last_diagnostic_at,
+                 last_ai_check_at, last_ai_diagnostic, last_ai_candidates_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (commande_id, DIAG_RAPPROCHEMENT_SUGGERE,
+                 SEVERITE_BY_DIAG[DIAG_RAPPROCHEMENT_SUGGERE],
+                 now_iso, now_iso, payload, cand_hash),
+            )
+        self.conn.commit()
+
+        parsed["_from_cache"] = False
+        parsed["_raw"] = raw
+        return parsed
+
+
+# ============================================================================
+# DeepSeekClient + helpers IA (etape 4)
+# ============================================================================
+
+AI_SYSTEM_PROMPT = (
+    "Tu es un expert en comptabilite publique francaise (M14/M57). "
+    "Tu analyses si une commande peut etre rapprochee de factures candidates. "
+    "Tu reponds TOUJOURS en JSON strict, sans preambule ni texte hors JSON."
+)
+
+AI_USER_PROMPT_TEMPLATE = """COMMANDE A RAPPROCHER:
+- N°: {num_commande}
+- Date: {date_commande}
+- Fournisseur: {fournisseur}
+- Marche: {marche}
+- Service emetteur: {service_emetteur}
+- Montant TTC: {montant_ttc} EUR
+- Reste a facturer: {reste} EUR
+- Libelle: {libelle}
+
+FACTURES CANDIDATES (factures dont le code_mouvement n'est pas le n° de cette commande,
+mais qui pourraient correspondre par fournisseur/marche/semantique):
+
+{factures_json}
+
+CONSIGNES:
+1. Evalue si UNE OU PLUSIEURS factures peuvent ensemble couvrir la commande
+2. Mefie-toi des DOUBLONS ADMINISTRATIFS : si la commande ressemble a un engagement deja
+   couvert par un autre code_mouvement (ex. maintenance annuelle facturee mensuellement par
+   la compta sans BC), signale-le explicitement
+3. Si marche renseigne des deux cotes, ils doivent matcher
+4. Date de facture posterieure (ou simultanee a 30j pres) a la commande
+5. Le montant alloue a chaque facture peut etre PARTIEL (ne pas depasser son montant_sf)
+6. Plusieurs factures peuvent cumuler pour atteindre le reste a facturer
+
+Reponds en JSON strict (pas de markdown, pas de fences):
+{{
+  "diagnostic": "MATCH" | "PARTIEL" | "DOUBLON" | "ORPHELINE" | "INDETERMINE",
+  "confidence": <int 0-100>,
+  "factures_a_lier": [
+    {{
+      "code_mouvement": "<str>",
+      "montant_alloue": <float>,
+      "raison": "<str max 100 char>"
+    }}
+  ],
+  "raisonnement": "<str max 500 char, explication globale>",
+  "action_suggeree": "VALIDER_AUTO" | "VALIDER_MANUEL" | "MARQUER_DOUBLON" | "RELANCER_FOURNISSEUR" | "INVESTIGUER"
+}}"""
+
+
+AI_VALID_DIAGNOSTICS = {"MATCH", "PARTIEL", "DOUBLON", "ORPHELINE", "INDETERMINE"}
+AI_VALID_ACTIONS = {"VALIDER_AUTO", "VALIDER_MANUEL", "MARQUER_DOUBLON",
+                    "RELANCER_FOURNISSEUR", "INVESTIGUER"}
+
+
+def compute_candidates_hash(candidates: list) -> str:
+    """Hash stable d'une liste de candidats (par code_mouvement trie).
+
+    Utilise pour invalider le cache IA si les candidats changent.
+    """
+    keys = sorted(
+        (c.get("code_mouvement") or "").strip()
+        for c in candidates
+    )
+    payload = "|".join(keys)
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def build_ai_user_prompt(cmd: dict, candidates: list) -> str:
+    """Construit le prompt utilisateur a partir d'une commande et de ses candidats."""
+    factures_payload = []
+    for c in candidates:
+        factures_payload.append({
+            "id": c.get("id"),
+            "num_facture": c.get("num_facture"),
+            "code_mouvement": c.get("code_mouvement"),
+            "fournisseur": c.get("fournisseur"),
+            "marche": c.get("marche"),
+            "date_facture": c.get("date_facture"),
+            "montant_sf": float(c.get("montant_service_fait") or 0.0),
+            "libelle": c.get("libelle"),
+        })
+    factures_json = json.dumps(factures_payload, ensure_ascii=False, indent=2)
+
+    return AI_USER_PROMPT_TEMPLATE.format(
+        num_commande=cmd.get("num_commande") or "—",
+        date_commande=cmd.get("date_commande") or "—",
+        fournisseur=cmd.get("fournisseur") or "—",
+        marche=cmd.get("marche") or "—",
+        service_emetteur=cmd.get("service_emetteur") or "—",
+        montant_ttc=f"{float(cmd.get('montant_ttc') or 0.0):.2f}",
+        reste=f"{float(cmd.get('reste_a_facturer') or 0.0):.2f}",
+        libelle=cmd.get("libelle") or "—",
+        factures_json=factures_json,
+    )
+
+
+def validate_ai_response(parsed: dict) -> None:
+    """Verifie la structure du JSON IA. Raise ValueError si invalide."""
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Reponse IA non-dict : {type(parsed).__name__}")
+    for key in ("diagnostic", "confidence", "factures_a_lier",
+                "raisonnement", "action_suggeree"):
+        if key not in parsed:
+            raise ValueError(f"Cle manquante dans la reponse IA : {key}")
+    if parsed["diagnostic"] not in AI_VALID_DIAGNOSTICS:
+        raise ValueError(
+            f"diagnostic IA invalide : {parsed['diagnostic']!r} "
+            f"(attendu {AI_VALID_DIAGNOSTICS})"
+        )
+    if parsed["action_suggeree"] not in AI_VALID_ACTIONS:
+        raise ValueError(
+            f"action_suggeree invalide : {parsed['action_suggeree']!r}"
+        )
+    try:
+        conf = int(parsed["confidence"])
+    except (TypeError, ValueError):
+        raise ValueError(f"confidence non-entiere : {parsed['confidence']!r}")
+    if not 0 <= conf <= 100:
+        raise ValueError(f"confidence hors plage 0-100 : {conf}")
+    if not isinstance(parsed["factures_a_lier"], list):
+        raise ValueError("factures_a_lier doit etre une liste")
+
+
+class DeepSeekClient:
+    """Client minimal pour l'API DeepSeek (compatible OpenAI chat/completions).
+
+    Implementation stdlib uniquement (urllib.request) pour eviter d'ajouter
+    'requests' aux dependances. Retry 3 tentatives avec backoff exponentiel
+    sur erreurs reseau et 5xx ; fail immediat sur 4xx.
+    """
+
+    def __init__(self, api_key: str,
+                 model: str = "deepseek-chat",
+                 endpoint: str = "https://api.deepseek.com/v1/chat/completions",
+                 timeout: int = 30):
+        if not api_key:
+            raise ValueError("api_key vide")
+        self.api_key = api_key
+        self.model = model
+        self.endpoint = endpoint
+        self.timeout = timeout
+
+    def chat(self, system_prompt: str, user_prompt: str,
+             max_tokens: int = 800, temperature: float = 0.1) -> str:
+        """Appel synchrone, retourne le texte brut de la reponse (content)."""
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "response_format": {"type": "json_object"},
+        }
+        data = json.dumps(body).encode("utf-8")
+        last_exc = None
+        for attempt in range(3):
+            req = urllib.request.Request(
+                self.endpoint,
+                data=data,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                payload = json.loads(raw)
+                # Format chat/completions standard
+                choices = payload.get("choices") or []
+                if not choices:
+                    raise ValueError(f"Pas de 'choices' dans la reponse : {raw[:200]}")
+                content = choices[0].get("message", {}).get("content")
+                if content is None:
+                    raise ValueError(f"Pas de 'message.content' : {raw[:200]}")
+                return content
+            except urllib.error.HTTPError as e:
+                # 4xx : pas de retry (cle invalide, prompt trop long, etc.)
+                if 400 <= e.code < 500:
+                    body_err = ""
+                    try:
+                        body_err = e.read().decode("utf-8", errors="replace")[:300]
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        f"HTTP {e.code} {e.reason} : {body_err}"
+                    ) from e
+                last_exc = e
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                last_exc = e
+            # Backoff exponentiel : 1s, 2s, 4s
+            if attempt < 2:
+                time.sleep(2 ** attempt)
+        raise RuntimeError(
+            f"Echec de l'appel DeepSeek apres 3 tentatives : {last_exc}"
+        ) from last_exc
+
+    @staticmethod
+    def parse_json_response(raw_text: str) -> dict:
+        """Extrait le premier JSON object d'une reponse texte.
+
+        Tolere :
+        - JSON brut : {"a": 1}
+        - Code fences markdown : ```json\\n{...}\\n```
+        - Preambule : "Voici la reponse :\\n{...}"
+
+        Raise ValueError si aucun JSON ne peut etre extrait.
+        """
+        if not isinstance(raw_text, str) or not raw_text.strip():
+            raise ValueError("Reponse IA vide")
+        text = raw_text.strip()
+
+        # Premier essai : json.loads tel quel
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+        # Deuxieme essai : retirer les fences markdown
+        fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```",
+                                text, re.DOTALL | re.IGNORECASE)
+        if fence_match:
+            try:
+                data = json.loads(fence_match.group(1))
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+
+        # Troisieme essai : trouver le premier { ... } equilibre
+        start = text.find("{")
+        if start >= 0:
+            depth = 0
+            in_string = False
+            escape = False
+            for i in range(start, len(text)):
+                ch = text[i]
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        candidate = text[start:i + 1]
+                        try:
+                            data = json.loads(candidate)
+                            if isinstance(data, dict):
+                                return data
+                        except json.JSONDecodeError:
+                            pass
+                        break
+        raise ValueError(f"Aucun JSON extractible : {text[:200]!r}")
+
+
+# ============================================================================
+# apply_ai_decision : politique de decision sur la reponse IA (spec 7.4)
+# ============================================================================
+
+ACTION_AUTO_DOUBLON = "AUTO_DOUBLON"
+ACTION_AUTO_LINKED = "AUTO_LINKED"
+ACTION_SUGGESTION = "SUGGESTION"
+ACTION_IGNORED = "IGNORED"
+
+
+def apply_ai_decision(conn: sqlite3.Connection,
+                      link_repo: LinkRepository,
+                      commande_id: int,
+                      ai_response: dict,
+                      auto_threshold: int = 90,
+                      min_threshold: int = 40) -> str:
+    """Applique la decision IA selon les seuils configures.
+
+    Renvoie une des constantes ACTION_* indiquant ce qui a ete fait.
+    Le commit SQL est gere ici. recompute_facturation reste a la charge de
+    l'appelant (UI), pour eviter une dependance vers la classe Database.
+    """
+    if not isinstance(ai_response, dict):
+        raise ValueError("ai_response doit etre un dict")
+    confidence = int(ai_response.get("confidence", 0))
+    diagnostic = ai_response.get("diagnostic")
+    action = ai_response.get("action_suggeree")
+    raisonnement = ai_response.get("raisonnement", "")[:1000]
+
+    cur = conn.cursor()
+
+    # Cas 1 : doublon administratif auto-marque
+    if (diagnostic == "DOUBLON" and action == "MARQUER_DOUBLON"
+            and confidence >= auto_threshold):
+        cur.execute(
+            "UPDATE commandes SET statut_metier = 'DOUBLON_ADMIN' WHERE id = ?",
+            (commande_id,),
+        )
+        conn.commit()
+        return ACTION_AUTO_DOUBLON
+
+    # Cas 2 : rapprochement automatique
+    if (diagnostic in ("MATCH", "PARTIEL") and action == "VALIDER_AUTO"
+            and confidence >= auto_threshold):
+        for f in ai_response.get("factures_a_lier", []):
+            code_mvt = (f.get("code_mouvement") or "").strip()
+            if not code_mvt:
+                continue
+            cur.execute(
+                "SELECT id FROM factures WHERE code_mouvement = ? "
+                "ORDER BY date_facture DESC LIMIT 1",
+                (code_mvt,),
+            )
+            row = cur.fetchone()
+            if row is None:
+                # On ne peut pas resoudre le code -> on saute silencieusement
+                continue
+            facture_id = row["id"]
+            try:
+                montant = float(f.get("montant_alloue") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if montant <= 0:
+                continue
+            try:
+                link_repo.add_link(
+                    commande_id=commande_id,
+                    facture_id=facture_id,
+                    montant_alloue=montant,
+                    source="ai_auto",
+                    confidence=confidence,
+                    ai_model=None,
+                    ai_reasoning=raisonnement,
+                    created_by="ai",
+                )
+            except (sqlite3.IntegrityError, ValueError):
+                # Lien deja existant ou contrainte -> on ignore et continue
+                continue
+        return ACTION_AUTO_LINKED
+
+    # Cas 3 : suggestion en cache (le diag est deja persiste par ai_match)
+    if confidence >= min_threshold:
+        return ACTION_SUGGESTION
+
+    return ACTION_IGNORED
