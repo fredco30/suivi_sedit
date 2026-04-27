@@ -1045,10 +1045,15 @@ class Database:
 
     def fetch_all_commandes(self):
         cur = self.conn.cursor()
+        # LEFT JOIN avec commande_diagnostic pour disposer de _diag / _diag_severite
+        # dans le model. Si la table est vide (premier demarrage avant diagnose),
+        # ces colonnes seront NULL et la colonne UI affichera "".
         cur.execute(
             """
-            SELECT * FROM commandes
-            ORDER BY date_commande DESC, fournisseur ASC
+            SELECT c.*, d.diagnostic AS _diag, d.severite AS _diag_severite
+            FROM commandes c
+            LEFT JOIN commande_diagnostic d ON d.commande_id = c.id
+            ORDER BY c.date_commande DESC, c.fournisseur ASC
             """
         )
         return cur.fetchall()
@@ -1520,7 +1525,31 @@ class Database:
 # ------------------ MODELES TABLE ------------------
 
 
+# Mapping diagnostic -> emoji + libelle pour la colonne "Diag" de l'onglet
+# Commandes (etape 6, spec 8.5). Aligne sur matching_dialog.DIAG_EMOJI/LABEL
+# mais redefini ici pour eviter une dependance d'import depuis le main file.
+DIAG_EMOJI_BY_NAME = {
+    "OK": "🟢",
+    "OK_RAPPROCHE": "🟢",
+    "RECENT": "⚪",
+    "EN_COURS": "🔵",
+    "RAPPROCHEMENT_SUGGERE": "🟡",
+    "OUBLI_PROBABLE": "🔴",
+    "DOUBLON_PROBABLE": "🟠",
+}
+DIAG_LABEL_BY_NAME = {
+    "OK": "OK",
+    "OK_RAPPROCHE": "OK (rapproche via lien manuel)",
+    "RECENT": "Recente (< 30j)",
+    "EN_COURS": "En cours (30-90j)",
+    "RAPPROCHEMENT_SUGGERE": "Rapprochement suggere",
+    "OUBLI_PROBABLE": "Oubli probable (> 90j sans candidat)",
+    "DOUBLON_PROBABLE": "Doublon probable",
+}
+
+
 COMMANDES_COLUMNS = [
+    ("_diag", "Diag"),
     ("exercice", "Exercice"),
     ("num_commande", "N°\nCommande"),
     ("fournisseur", "Fournisseur"),
@@ -1564,6 +1593,17 @@ class CommandesTableModel(QAbstractTableModel):
             return None
         row = self.rows[index.row()]
         key, _ = COMMANDES_COLUMNS[index.column()]
+
+        # Colonne virtuelle "Diag" : emoji + tooltip + alignement centre
+        if key == "_diag":
+            diag = row["_diag"] if "_diag" in row.keys() else None
+            if role == Qt.DisplayRole:
+                return DIAG_EMOJI_BY_NAME.get(diag, "")
+            if role == Qt.ToolTipRole:
+                return DIAG_LABEL_BY_NAME.get(diag, "Pas encore diagnostique")
+            if role == Qt.TextAlignmentRole:
+                return Qt.AlignCenter
+            return None
 
         if role == Qt.DisplayRole:
             value = row[key]
@@ -1688,6 +1728,14 @@ class CommandesProxy(QSortFilterProxyModel):
         src = self.sourceModel()
         col = left.column()
         key, _ = COMMANDES_COLUMNS[col]
+
+        # Tri sur la colonne Diag : par severite numerique (NULL = -1)
+        if key == "_diag":
+            l_row = src.rows[left.row()]
+            r_row = src.rows[right.row()]
+            ls = l_row["_diag_severite"] if "_diag_severite" in l_row.keys() else None
+            rs = r_row["_diag_severite"] if "_diag_severite" in r_row.keys() else None
+            return (ls if ls is not None else -1) < (rs if rs is not None else -1)
 
         lv = src.rows[left.row()][key]
         rv = src.rows[right.row()][key]
@@ -2442,6 +2490,189 @@ class ConfigDialog(QDialog):
             QApplication.restoreOverrideCursor()
 
 
+# ------------------ DIAGNOSTIC SANTE (etape 6, spec 12) ------------------
+
+
+class DiagnosticSanteDialog(QDialog):
+    """Vue synthetique de l'etat du systeme : compteurs de commandes,
+    factures, liens manuels par source, distribution des diagnostics
+    avec montants. Bouton d'export CSV.
+    """
+
+    def __init__(self, db, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self.setWindowTitle("Diagnostic santé du systeme")
+        self.resize(720, 600)
+
+        self._stats = self._collect_stats()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
+
+        title = QLabel("<h2>Diagnostic santé</h2>")
+        layout.addWidget(title)
+
+        self.text_view = QLabel(self._render_html())
+        self.text_view.setWordWrap(True)
+        self.text_view.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.text_view.setStyleSheet(
+            "QLabel { background: #fafafa; border: 1px solid #ddd; "
+            "padding: 12px; border-radius: 4px; }"
+        )
+        layout.addWidget(self.text_view, 1)
+
+        # Boutons bas
+        btns = QHBoxLayout()
+        self.btn_export = QPushButton("📤 Exporter rapport CSV")
+        self.btn_export.clicked.connect(self._on_export_csv)
+        btns.addWidget(self.btn_export)
+        btns.addStretch(1)
+        btn_close = QPushButton("Fermer")
+        btn_close.clicked.connect(self.accept)
+        btns.addWidget(btn_close)
+        layout.addLayout(btns)
+
+    def _collect_stats(self) -> dict:
+        cur = self.db.conn.cursor()
+        stats = {}
+
+        cur.execute("SELECT COUNT(*) AS n, COALESCE(SUM(montant_ttc), 0) AS s "
+                    "FROM commandes")
+        r = cur.fetchone()
+        stats["commandes_count"] = r["n"]
+        stats["commandes_total"] = float(r["s"] or 0.0)
+
+        cur.execute("SELECT COUNT(*) AS n, COALESCE(SUM(montant_ttc), 0) AS s "
+                    "FROM factures")
+        r = cur.fetchone()
+        stats["factures_count"] = r["n"]
+        stats["factures_total"] = float(r["s"] or 0.0)
+
+        cur.execute(
+            "SELECT source, COUNT(*) AS n, COALESCE(SUM(montant_alloue), 0) AS s "
+            "FROM manual_links GROUP BY source"
+        )
+        stats["links_by_source"] = [
+            {"source": r["source"], "count": r["n"], "total": float(r["s"] or 0.0)}
+            for r in cur.fetchall()
+        ]
+
+        cur.execute(
+            "SELECT diagnostic, COUNT(*) AS n, "
+            "COALESCE(SUM(montant_candidates_total), 0) AS s_cand "
+            "FROM commande_diagnostic GROUP BY diagnostic"
+        )
+        diag_rows = {r["diagnostic"]: (r["n"], float(r["s_cand"] or 0.0))
+                     for r in cur.fetchall()}
+        stats["diagnostics"] = diag_rows
+
+        # Montants reste-a-facturer pour les commandes par diagnostic
+        cur.execute(
+            "SELECT d.diagnostic, COALESCE(SUM(c.reste_a_facturer), 0) AS s "
+            "FROM commande_diagnostic d "
+            "JOIN commandes c ON c.id = d.commande_id "
+            "GROUP BY d.diagnostic"
+        )
+        reste_par_diag = {r["diagnostic"]: float(r["s"] or 0.0) for r in cur.fetchall()}
+        stats["reste_par_diag"] = reste_par_diag
+        return stats
+
+    def _render_html(self) -> str:
+        s = self._stats
+        n_cmd = s["commandes_count"]
+        n_fact = s["factures_count"]
+
+        def pct(n):
+            return f"{(n / n_cmd * 100):.0f}%" if n_cmd > 0 else "0%"
+
+        def fmt_eur(v):
+            return f"{v:,.2f} €".replace(",", " ").replace(".", ",")
+
+        html = []
+        html.append("<b>Etat de la base :</b>")
+        html.append("<ul>")
+        html.append(
+            f"<li>{n_fact} factures importees ({fmt_eur(s['factures_total'])})</li>"
+        )
+        html.append(
+            f"<li>{n_cmd} commandes ({fmt_eur(s['commandes_total'])})</li>"
+        )
+        # Liens par source
+        if s["links_by_source"]:
+            for L in s["links_by_source"]:
+                html.append(
+                    f"<li>Liens {L['source']} : {L['count']} "
+                    f"({fmt_eur(L['total'])})</li>"
+                )
+        else:
+            html.append("<li>Aucun lien manuel/IA enregistre</li>")
+        html.append("</ul>")
+
+        html.append("<br><b>Diagnostic des commandes :</b>")
+        html.append("<ul>")
+        ordered = [
+            ("OK", "OK"),
+            ("OK_RAPPROCHE", "OK via lien manuel/IA"),
+            ("RECENT", "Recentes (< 30j)"),
+            ("EN_COURS", "En cours (30-90j)"),
+            ("RAPPROCHEMENT_SUGGERE", "Suggestions de rapprochement"),
+            ("OUBLI_PROBABLE", "Oublis probables"),
+            ("DOUBLON_PROBABLE", "Doublons admin"),
+        ]
+        diag_rows = s["diagnostics"]
+        reste = s.get("reste_par_diag", {})
+        for code, label in ordered:
+            n, _ = diag_rows.get(code, (0, 0.0))
+            r = reste.get(code, 0.0)
+            emoji = DIAG_EMOJI_BY_NAME.get(code, "")
+            extra = f" — reste a facturer : {fmt_eur(r)}" if r > 0 else ""
+            html.append(f"<li>{emoji} {label} : {n} ({pct(n)}){extra}</li>")
+        html.append("</ul>")
+
+        # Total reste a facturer non-couvert
+        total_reste = sum(reste.values())
+        html.append(
+            f"<br><b>Reste a facturer total (toutes commandes) :</b> "
+            f"{fmt_eur(total_reste)}"
+        )
+        return "\n".join(html)
+
+    def _on_export_csv(self):
+        from PyQt5.QtWidgets import QFileDialog
+        default_name = f"diagnostic_sante_{date.today().isoformat()}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Exporter le rapport en CSV",
+            default_name, "Fichiers CSV (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            self._write_csv(path)
+            QMessageBox.information(self, "Export OK", f"Rapport ecrit :\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur export", f"Impossible d'ecrire :\n{e}")
+
+    def _write_csv(self, path: str):
+        import csv as _csv
+        s = self._stats
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            w = _csv.writer(f, delimiter=";")
+            w.writerow(["Section", "Cle", "Valeur"])
+            w.writerow(["base", "factures_count", s["factures_count"]])
+            w.writerow(["base", "factures_total_ttc", f"{s['factures_total']:.2f}"])
+            w.writerow(["base", "commandes_count", s["commandes_count"]])
+            w.writerow(["base", "commandes_total_ttc", f"{s['commandes_total']:.2f}"])
+            for L in s["links_by_source"]:
+                w.writerow(["liens", f"source={L['source']}",
+                            f"{L['count']} liens / {L['total']:.2f} EUR"])
+            for diag, (n, _) in s["diagnostics"].items():
+                w.writerow(["diagnostic", diag, n])
+            for diag, r in s["reste_par_diag"].items():
+                w.writerow(["reste_a_facturer", diag, f"{r:.2f}"])
+
+
 # ------------------ FENETRE PRINCIPALE ------------------
 
 
@@ -2453,6 +2684,17 @@ class MainWindow(QMainWindow):
 
         self.db = Database(db_path)
         self.error_log = []  # journal des erreurs pour export
+
+        # Pre-classification au demarrage (etape 6) : peuple commande_diagnostic
+        # pour que la colonne "Diag" soit alimentee des l'ouverture, sans
+        # necessiter d'ouvrir l'assistant de rapprochement.
+        try:
+            from matching_module import LinkRepository, MatchingEngine
+            _diag_repo = LinkRepository(self.db.conn)
+            _diag_engine = MatchingEngine(self.db.conn, _diag_repo)
+            _diag_engine.diagnose_all_commandes()
+        except Exception as e:
+            print(f"[STARTUP-DIAG] {e}")
 
         # Modèles Commandes
         self.cmd_model = CommandesTableModel(self.db)
@@ -3142,6 +3384,11 @@ class MainWindow(QMainWindow):
         act_matching.setToolTip("Assistant de rapprochement commandes ↔ factures (avec assistance IA)")
         act_matching.triggered.connect(self.open_matching_assistant)
         tb1.addAction(act_matching)
+
+        act_diag = QAction("🩺 Diagnostic santé", self)
+        act_diag.setToolTip("Vue synthetique de l'etat du systeme : compteurs, distribution des diagnostics, export CSV")
+        act_diag.triggered.connect(self.open_diagnostic_sante)
+        tb1.addAction(act_diag)
 
         # Séparateur élégant
         separator1 = tb1.addSeparator()
@@ -6307,6 +6554,28 @@ class MainWindow(QMainWindow):
         if dlg.exec_() == QDialog.Accepted:
             # relance le timer avec le nouvel intervalle
             self.reminder_timer.setInterval(self._get_reminder_interval() * 60 * 1000)
+
+    def open_diagnostic_sante(self):
+        # Re-diagnostic avant affichage pour avoir des chiffres a jour
+        try:
+            from matching_module import LinkRepository, MatchingEngine
+            link_repo = LinkRepository(self.db.conn)
+            engine = MatchingEngine(self.db.conn, link_repo)
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+            try:
+                self.db.recompute_facturation()
+                engine.diagnose_all_commandes()
+            finally:
+                QApplication.restoreOverrideCursor()
+        except Exception as e:
+            print(f"[DIAG-SANTE] Re-diagnose KO : {e}")
+        dlg = DiagnosticSanteDialog(self.db, self)
+        dlg.exec_()
+        # Refresh la colonne Diag de l'onglet Commandes apres
+        try:
+            self.cmd_model.refresh()
+        except Exception:
+            pass
 
     def open_matching_assistant(self):
         try:

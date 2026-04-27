@@ -248,6 +248,25 @@ class MatchingDialog(QDialog):
         self.age_min_spin.valueChanged.connect(self._apply_filters)
         layout.addWidget(self.age_min_spin)
 
+        # Marche
+        layout.addWidget(QLabel("Marche :"))
+        self.marche_combo = QComboBox()
+        self.marche_combo.setMinimumWidth(140)
+        self.marche_combo.addItem("[Tous]", "")
+        self.marche_combo.currentIndexChanged.connect(self._apply_filters)
+        layout.addWidget(self.marche_combo)
+
+        # Montant TTC min
+        layout.addWidget(QLabel("Montant min :"))
+        self.montant_min_spin = QSpinBox()
+        self.montant_min_spin.setRange(0, 10_000_000)
+        self.montant_min_spin.setValue(0)
+        self.montant_min_spin.setSingleStep(100)
+        self.montant_min_spin.setSuffix(" €")
+        self.montant_min_spin.setMaximumWidth(110)
+        self.montant_min_spin.valueChanged.connect(self._apply_filters)
+        layout.addWidget(self.montant_min_spin)
+
         # Afficher ecartees
         self.show_dismissed_cb = QCheckBox("Afficher ecartees")
         self.show_dismissed_cb.setChecked(False)
@@ -513,6 +532,24 @@ class MatchingDialog(QDialog):
                 self.fourn_combo.setCurrentIndex(idx)
         self.fourn_combo.blockSignals(False)
 
+        # Combo marche
+        prev_m = self.marche_combo.currentData()
+        self.marche_combo.blockSignals(True)
+        self.marche_combo.clear()
+        self.marche_combo.addItem("[Tous]", "")
+        marches = set()
+        for r in self._all_rows:
+            m = (r.get("marche") or "").strip()
+            if m:
+                marches.add(m)
+        for m in sorted(marches):
+            self.marche_combo.addItem(m, m)
+        if prev_m:
+            idx = self.marche_combo.findData(prev_m)
+            if idx >= 0:
+                self.marche_combo.setCurrentIndex(idx)
+        self.marche_combo.blockSignals(False)
+
     def _update_counts_label(self, counts: dict):
         total = sum(counts.values())
         bits = [f"{total} commandes"]
@@ -529,7 +566,9 @@ class MatchingDialog(QDialog):
     def _apply_filters(self):
         active_diags = {d for d, cb in self.diag_checks.items() if cb.isChecked()}
         fourn_filter = self.fourn_combo.currentData() or ""
+        marche_filter = self.marche_combo.currentData() or ""
         age_min = self.age_min_spin.value()
+        montant_min = float(self.montant_min_spin.value())
         show_dismissed = self.show_dismissed_cb.isChecked()
         today_iso = datetime.now().date().isoformat()
 
@@ -546,9 +585,15 @@ class MatchingDialog(QDialog):
                 continue
             if fourn_filter and (r.get("fournisseur") or "").strip() != fourn_filter:
                 continue
+            if marche_filter and (r.get("marche") or "").strip() != marche_filter:
+                continue
             age = r.get("age_jours")
             if age is not None and age < age_min:
                 continue
+            if montant_min > 0:
+                ttc = float(r.get("montant_ttc") or 0.0)
+                if ttc < montant_min:
+                    continue
             if not show_dismissed:
                 du = r.get("dismissed_until")
                 if du and du > today_iso:
