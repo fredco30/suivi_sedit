@@ -577,6 +577,22 @@ class Database:
             cur.execute("ALTER TABLE commandes ADD COLUMN statut_metier TEXT")
             self.conn.commit()
 
+        # Migration: ajouter notes a commande_diagnostic (annotations utilisateur)
+        try:
+            cur.execute("SELECT notes FROM commande_diagnostic LIMIT 1")
+        except sqlite3.OperationalError:
+            print("[MIGRATION] Ajout de la colonne commande_diagnostic.notes")
+            cur.execute("ALTER TABLE commande_diagnostic ADD COLUMN notes TEXT")
+            self.conn.commit()
+
+        # Migration: ajouter dismissed_until a commande_diagnostic (bouton "Pas de match")
+        try:
+            cur.execute("SELECT dismissed_until FROM commande_diagnostic LIMIT 1")
+        except sqlite3.OperationalError:
+            print("[MIGRATION] Ajout de la colonne commande_diagnostic.dismissed_until")
+            cur.execute("ALTER TABLE commande_diagnostic ADD COLUMN dismissed_until TEXT")
+            self.conn.commit()
+
         self.conn.commit()
 
     # -------------- Config --------------
@@ -2968,6 +2984,11 @@ class MainWindow(QMainWindow):
         for widget in tb1.children():
             if isinstance(widget, QWidget) and widget.property("text") == "⚙ Configuration…":
                 widget.setObjectName("config_btn")
+
+        act_matching = QAction("🔗 Rapprochement", self)
+        act_matching.setToolTip("Assistant de rapprochement commandes ↔ factures (avec assistance IA)")
+        act_matching.triggered.connect(self.open_matching_assistant)
+        tb1.addAction(act_matching)
 
         # Séparateur élégant
         separator1 = tb1.addSeparator()
@@ -6033,6 +6054,28 @@ class MainWindow(QMainWindow):
         if dlg.exec_() == QDialog.Accepted:
             # relance le timer avec le nouvel intervalle
             self.reminder_timer.setInterval(self._get_reminder_interval() * 60 * 1000)
+
+    def open_matching_assistant(self):
+        try:
+            from matching_dialog import MatchingDialog
+        except ImportError as e:
+            QMessageBox.critical(
+                self,
+                "Module manquant",
+                f"Impossible de charger l'assistant de rapprochement :\n{e}",
+            )
+            return
+        dlg = MatchingDialog(self.db, self)
+        dlg.exec_()
+        # Apres usage, on rafraichit toutes les vues qui dependent de la facturation
+        self.db.recompute_facturation()
+        self.cmd_model.refresh()
+        self.synth_model.refresh()
+        if hasattr(self, "refresh_rappels_tab"):
+            try:
+                self.refresh_rappels_tab()
+            except Exception:
+                pass
 
     def closeEvent(self, event):
         if self.error_log:
