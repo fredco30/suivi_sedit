@@ -501,6 +501,51 @@ class Database:
             """
         )
 
+        # Table Manual Links - liens manuels/IA entre commandes et factures
+        # (vient s'ajouter au rapprochement natif code_mouvement = num_commande)
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS manual_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                commande_id INTEGER NOT NULL,
+                facture_id INTEGER NOT NULL,
+                montant_alloue REAL NOT NULL,
+                confidence INTEGER,
+                source TEXT NOT NULL,
+                ai_model TEXT,
+                ai_reasoning TEXT,
+                created_by TEXT,
+                created_at TEXT NOT NULL,
+                validated_at TEXT,
+                notes TEXT,
+                UNIQUE(commande_id, facture_id),
+                FOREIGN KEY (commande_id) REFERENCES commandes(id) ON DELETE CASCADE,
+                FOREIGN KEY (facture_id) REFERENCES factures(id) ON DELETE CASCADE
+            )
+            """
+        )
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_manual_links_cmd ON manual_links(commande_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_manual_links_fact ON manual_links(facture_id)")
+
+        # Table Commande Diagnostic - pre-classification et cache IA par commande
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS commande_diagnostic (
+                commande_id INTEGER PRIMARY KEY,
+                age_jours INTEGER,
+                diagnostic TEXT NOT NULL,
+                severite INTEGER,
+                candidates_count INTEGER DEFAULT 0,
+                candidates_same_marche INTEGER DEFAULT 0,
+                montant_candidates_total REAL DEFAULT 0,
+                last_ai_check_at TEXT,
+                last_ai_diagnostic TEXT,
+                last_diagnostic_at TEXT NOT NULL,
+                FOREIGN KEY (commande_id) REFERENCES commandes(id) ON DELETE CASCADE
+            )
+            """
+        )
+
         # Migration: ajouter source_file aux commandes
         try:
             cur.execute("SELECT source_file FROM commandes LIMIT 1")
@@ -522,6 +567,14 @@ class Database:
             print("[MIGRATION] Ajout de la colonne 'type_marche'")
             # Par défaut, tous les marchés existants sont considérés comme "CLASSIQUE"
             cur.execute("ALTER TABLE marches ADD COLUMN type_marche TEXT DEFAULT 'CLASSIQUE'")
+            self.conn.commit()
+
+        # Migration: ajouter statut_metier aux commandes (DOUBLON_ADMIN, ANNULEE...)
+        try:
+            cur.execute("SELECT statut_metier FROM commandes LIMIT 1")
+        except sqlite3.OperationalError:
+            print("[MIGRATION] Ajout de la colonne 'statut_metier'")
+            cur.execute("ALTER TABLE commandes ADD COLUMN statut_metier TEXT")
             self.conn.commit()
 
         self.conn.commit()
@@ -1165,17 +1218,22 @@ class Database:
 
     def recompute_facturation(self):
         """Calcule et met à jour pour chaque commande :
-        - montant_facture : somme des Montant service fait des factures liées (code_mouvement = num_commande)
+        - montant_facture : somme des Montant service fait des factures liees, en cumulant
+          le rapprochement natif (code_mouvement = num_commande) ET les manual_links.
         - reste_a_facturer : montant_commande - montant_facture
         - statut_facturation : Non / Partiellement / Totalement facturée
 
-        Règle complémentaire :
+        Cas particulier statut_metier = 'DOUBLON_ADMIN' :
+        - la commande sort du calcul (reste_a_facturer = 0)
+        - statut_facturation = 'Doublon administratif', statut = 'Annulée'
+
+        Règle complémentaire (inchangée) :
         - si statut_facturation est "Partiellement facturée" ou "Totalement facturée",
           le statut de la commande est automatiquement positionné à "Envoyée".
         """
         cur = self.conn.cursor()
 
-        # Somme des montants service fait par commande (code_mouvement)
+        # 1. Total natif par num_commande (jointure code_mouvement = num_commande)
         cur.execute(
             """
             SELECT code_mouvement, SUM(montant_service_fait) AS total
@@ -1184,15 +1242,44 @@ class Database:
             GROUP BY code_mouvement
             """
         )
-        totals = {row["code_mouvement"]: (row["total"] or 0.0) for row in cur.fetchall()}
+        totals_natif = {row["code_mouvement"]: (row["total"] or 0.0) for row in cur.fetchall()}
 
-        # Recalcule pour chaque commande
-        cur.execute("SELECT id, num_commande, montant_ttc, statut FROM commandes")
+        # 2. Total via manual_links par commande_id (peut etre absent si la table vient
+        # d'etre creee, mais elle existe toujours grace a _init_schema).
+        cur.execute(
+            """
+            SELECT commande_id, SUM(montant_alloue) AS total
+            FROM manual_links
+            GROUP BY commande_id
+            """
+        )
+        totals_manual = {row["commande_id"]: (row["total"] or 0.0) for row in cur.fetchall()}
+
+        # 3. Recalcule pour chaque commande
+        cur.execute("SELECT id, num_commande, montant_ttc, statut, statut_metier FROM commandes")
         rows = cur.fetchall()
         for row in rows:
+            cmd_id = row["id"]
             num = row["num_commande"]
             mt_cmd = row["montant_ttc"] or 0.0
-            mt_fact = totals.get(num, 0.0)
+
+            # Court-circuit pour les commandes marquees comme doublons administratifs :
+            # elles sortent du calcul de reste a facturer.
+            if row["statut_metier"] == "DOUBLON_ADMIN":
+                cur.execute(
+                    """
+                    UPDATE commandes
+                    SET montant_facture = 0,
+                        reste_a_facturer = 0,
+                        statut_facturation = 'Doublon administratif',
+                        statut = 'Annulée'
+                    WHERE id = ?
+                    """,
+                    (cmd_id,),
+                )
+                continue
+
+            mt_fact = totals_natif.get(num, 0.0) + totals_manual.get(cmd_id, 0.0)
             reste = mt_cmd - mt_fact
 
             # Statut de facturation
@@ -1219,7 +1306,7 @@ class Database:
                 SET montant_facture = ?, reste_a_facturer = ?, statut_facturation = ?, statut = ?
                 WHERE id = ?
                 """,
-                (mt_fact, reste, statut_fact, new_statut, row["id"]),
+                (mt_fact, reste, statut_fact, new_statut, cmd_id),
             )
 
         self.conn.commit()
