@@ -4,6 +4,8 @@ Calcule la vision globale par marché et le détail par tranche
 Avec synchronisation SQLite pour optimiser les performances
 """
 
+import os
+
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Tuple, Optional
@@ -11,6 +13,13 @@ from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 from marches_sync import MarchesSync
+from suivi_financier_agg import (
+    Ecriture,
+    ResultatSuivi,
+    STATUT_ENGAGEMENT,
+    STATUT_FACTURE,
+    agreger_ecritures,
+)
 
 
 class MarchesAnalyzer:
@@ -24,6 +33,7 @@ class MarchesAnalyzer:
     - AH (33): Montant service fait
     - AI (34): Date service fait
     - AM (38): Commande
+    - E (4): Code mouvement (n° d'engagement, repli du n° de commande)
     - AN (39): Marché
     - AO (40): Tranche
     - AT (45): Mandat
@@ -41,23 +51,80 @@ class MarchesAnalyzer:
     COL_FOURNISSEUR = 8        # I - Nom tiers
     COL_LIBELLE = 13           # N - Libellé
     COL_FACTURE = 36           # AL - Facture
+    COL_CODE_MOUVEMENT = 4     # E - Code mouvement (n° d'engagement)
 
-    def __init__(self, excel_path: str, database=None, use_cache: bool = True):
+    # Provenance de l'enveloppe initiale affichée dans l'en-tête de l'export
+    ENVELOPPE_BASE = "base"
+    ENVELOPPE_SEDIT = "sedit"
+    ENVELOPPE_ABSENTE = "absente"
+    # Du plus fiable au moins fiable : la provenance la plus faible d'un
+    # groupe l'emporte sur l'en-tête.
+    RANG_PROVENANCE = {ENVELOPPE_BASE: 0, ENVELOPPE_SEDIT: 1, ENVELOPPE_ABSENTE: 2}
+
+    SOURCE_DATABASE = "database_sync"
+    EXTENSIONS_EXCEL = (".xls", ".xlsx", ".xlsm")
+
+    def __init__(self, excel_path, database=None, use_cache: bool = True,
+                 cache_path: Optional[str] = None):
         """
-        Initialise l'analyseur avec le chemin du fichier Excel.
+        Initialise l'analyseur avec la ou les sources de factures.
 
         Args:
-            excel_path: Chemin vers le fichier Excel des factures
+            excel_path: Source des factures. Accepte un chemin de fichier, un
+                motif (`data_sources/factures*.xls`), un répertoire, une liste
+                de ces formes, ou le mot-clé "database_sync" pour ne lire que
+                le cache. Les exports SEDIT étant annuels, le suivi d'une
+                opération pluriannuelle se lit sur leur réunion.
             database: Instance de Database pour accéder aux ajustements manuels (optionnel)
             use_cache: Utiliser le cache SQLite (True par défaut)
+            cache_path: Fichier de cache SQLite à utiliser. Par défaut celui de
+                l'application ; un traitement en lot a intérêt à en nommer un
+                autre pour ne pas modifier le cache de travail.
         """
         self.excel_path = excel_path
         self.df = None
         self.df_marches = None
         self.db = database
         self.use_cache = use_cache
-        self.sync = MarchesSync() if use_cache else None
+        self.cache_path = cache_path
+        self.sync = MarchesSync(cache_path) if use_cache and cache_path else (
+            MarchesSync() if use_cache else None
+        )
         self.sync_stats = None
+        self._vision_operations = None
+
+    @classmethod
+    def resoudre_sources(cls, excel_path) -> List[str]:
+        """Développe une source en liste de fichiers Excel, sans doublon.
+
+        Un répertoire est développé en ses fichiers Excel, un motif en ses
+        correspondances ; l'ordre est stable pour que deux chargements
+        successifs produisent le même cache.
+        """
+        import glob as _glob
+
+        entrees = [excel_path] if isinstance(excel_path, str) else list(excel_path or [])
+        fichiers: List[str] = []
+
+        for entree in entrees:
+            entree = str(entree)
+            if entree == cls.SOURCE_DATABASE:
+                continue
+            if os.path.isdir(entree):
+                trouves = [
+                    chemin for chemin in sorted(_glob.glob(os.path.join(entree, "*")))
+                    if chemin.lower().endswith(cls.EXTENSIONS_EXCEL)
+                ]
+            elif any(joker in entree for joker in "*?["):
+                trouves = sorted(_glob.glob(entree))
+            else:
+                trouves = [entree]
+
+            for chemin in trouves:
+                if chemin not in fichiers:
+                    fichiers.append(chemin)
+
+        return fichiers
 
     @staticmethod
     def extract_exercice_from_bdc(num_commande) -> str:
@@ -87,9 +154,91 @@ class MarchesAnalyzer:
         exercices_list = sorted(exercices)
         return ["Tous"] + exercices_list
 
+    def _resoudre_num_bdc(self, df: pd.DataFrame) -> pd.Series:
+        """N° de bon de commande de chaque ligne SEDIT.
+
+        La colonne « Commande » (AM) n'est renseignée que lorsque la ligne a été
+        rattachée à un bon de commande — elle est vide sur près de 40 % des
+        lignes, qui se retrouvaient alors sans BDC et hors de toute agrégation.
+        La colonne « Code mouvement » (E) porte le n° d'engagement sur toutes
+        les lignes et concorde avec « Commande » partout où les deux sont
+        renseignées : elle sert donc de repli.
+        """
+        commande = df.iloc[:, self.COL_COMMANDE]
+        mouvement = df.iloc[:, self.COL_CODE_MOUVEMENT]
+        vide = commande.isna() | (commande.astype(str).str.strip() == '')
+        return commande.mask(vide, mouvement)
+
+    def _preparer_lignes_a_synchroniser(self, df_excel: pd.DataFrame) -> pd.DataFrame:
+        """Extrait d'un export SEDIT les colonnes conservées dans le cache."""
+        df_to_sync = df_excel[
+            df_excel.iloc[:, self.COL_MARCHE].notna() &
+            (df_excel.iloc[:, self.COL_MARCHE] != '')
+        ].copy()
+
+        return pd.DataFrame({
+            'marche': df_to_sync.iloc[:, self.COL_MARCHE],
+            'fournisseur': df_to_sync.iloc[:, self.COL_FOURNISSEUR],
+            'libelle': df_to_sync.iloc[:, self.COL_LIBELLE],
+            'date_sf': df_to_sync.iloc[:, self.COL_DATE_SF],
+            'num_facture': df_to_sync.iloc[:, self.COL_FACTURE],
+            'montant_initial': df_to_sync.iloc[:, self.COL_MONTANT_INITIAL],
+            'montant_sf': df_to_sync.iloc[:, self.COL_MONTANT_SF],
+            'montant_ttc': df_to_sync.iloc[:, self.COL_MONTANT_TTC],
+            'num_mandat': df_to_sync.iloc[:, self.COL_MANDAT],
+            'tranche': df_to_sync.iloc[:, self.COL_TRANCHE],
+            'commande': self._resoudre_num_bdc(df_to_sync),
+        })
+
+    def _synchroniser_sources(self, sources: List[str], force_reload: bool) -> Dict:
+        """Synchronise chaque fichier source vers le cache et cumule les stats.
+
+        Chaque fichier est traité indépendamment : une ligne présente dans
+        plusieurs exports annuels n'est stockée qu'une fois, et la
+        synchronisation de l'un ne retire jamais les lignes des autres.
+        """
+        cumul = {
+            'nb_inserted': 0, 'nb_updated': 0, 'nb_unchanged': 0, 'nb_deleted': 0,
+            'duration': 0.0, 'status': 'success', 'sources': [], 'nb_sources': len(sources),
+        }
+
+        for source in sources:
+            needs_sync, reason = self.sync.file_needs_sync(source)
+            if not (needs_sync or force_reload):
+                print(f"[CACHE] {source} : {reason}")
+                cumul['sources'].append({'fichier': source, 'status': 'cached', 'message': reason})
+                continue
+
+            print(f"[SYNC] {source} : {reason}")
+            try:
+                df_excel = pd.read_excel(source)
+            except Exception as e:
+                print(f"[ERREUR] Lecture impossible de {source} : {e}")
+                cumul['status'] = 'partial'
+                cumul['sources'].append({'fichier': source, 'status': 'error', 'message': str(e)})
+                continue
+
+            stats = self.sync.sync_from_excel(
+                source, self._preparer_lignes_a_synchroniser(df_excel), force=force_reload
+            )
+            stats['fichier'] = source
+            cumul['sources'].append(stats)
+
+            if stats.get('status') == 'error':
+                cumul['status'] = 'partial'
+                continue
+
+            for cle in ('nb_inserted', 'nb_updated', 'nb_unchanged', 'nb_deleted', 'duration'):
+                cumul[cle] += stats.get(cle, 0)
+
+        print(f"[OK] Sync terminee sur {len(sources)} fichier(s) : "
+              f"{cumul['nb_inserted']} inserees, {cumul['nb_deleted']} supprimees, "
+              f"{cumul['nb_unchanged']} inchangees (duree: {cumul['duration']:.2f}s)")
+        return cumul
+
     def load_data(self, force_reload: bool = False):
         """
-        Charge les données depuis le fichier Excel avec synchronisation SQLite.
+        Charge les données depuis le ou les fichiers Excel, via le cache SQLite.
 
         Args:
             force_reload: Force le rechargement depuis Excel même si le cache est valide
@@ -97,59 +246,29 @@ class MarchesAnalyzer:
         Returns:
             True si succès, False sinon
         """
+        # Les données changent : la vision mémorisée n'est plus valable.
+        self._vision_operations = None
+
         try:
             if self.use_cache and self.sync:
                 # Si le chemin est "database_sync", charger uniquement depuis le cache
                 # (les données ont déjà été synchronisées depuis la base de données)
-                if self.excel_path == "database_sync":
+                if self.excel_path == self.SOURCE_DATABASE:
                     print(f"[CACHE] Chargement depuis le cache (source: database)")
                     self.sync_stats = {'status': 'cached', 'message': 'Données depuis database'}
                 else:
-                    # Vérifier si synchronisation nécessaire
-                    needs_sync, reason = self.sync.file_needs_sync(self.excel_path)
+                    sources = self.resoudre_sources(self.excel_path)
+                    if not sources:
+                        print(f"[ERREUR] Aucun fichier source trouvé pour {self.excel_path!r}")
+                        return False
 
-                    if needs_sync or force_reload:
-                        print(f"[SYNC] Synchronisation necessaire: {reason}")
+                    # Un fichier retiré de la sélection ne doit plus peser sur
+                    # le suivi : ses lignes sortent du cache.
+                    nb_elaguees = self.sync.prune_sources(sources)
+                    if nb_elaguees:
+                        print(f"[SYNC] {nb_elaguees} lignes retirées (fichiers hors sélection)")
 
-                        # Charger depuis Excel pour synchroniser
-                        df_excel = pd.read_excel(self.excel_path)
-
-                        # Préparer les données pour la synchronisation
-                        df_to_sync = df_excel[
-                            df_excel.iloc[:, self.COL_MARCHE].notna() &
-                            (df_excel.iloc[:, self.COL_MARCHE] != '')
-                        ].copy()
-
-                        # Renommer les colonnes pour correspondre au schéma SQLite
-                        df_to_sync_renamed = pd.DataFrame({
-                            'marche': df_to_sync.iloc[:, self.COL_MARCHE],
-                            'fournisseur': df_to_sync.iloc[:, self.COL_FOURNISSEUR],
-                            'libelle': df_to_sync.iloc[:, self.COL_LIBELLE],
-                            'date_sf': df_to_sync.iloc[:, self.COL_DATE_SF],
-                            'num_facture': df_to_sync.iloc[:, self.COL_FACTURE],
-                            'montant_initial': df_to_sync.iloc[:, self.COL_MONTANT_INITIAL],
-                            'montant_sf': df_to_sync.iloc[:, self.COL_MONTANT_SF],
-                            'montant_ttc': df_to_sync.iloc[:, self.COL_MONTANT_TTC],
-                            'num_mandat': df_to_sync.iloc[:, self.COL_MANDAT],
-                            'tranche': df_to_sync.iloc[:, self.COL_TRANCHE],
-                            'commande': df_to_sync.iloc[:, self.COL_COMMANDE],
-                        })
-
-                        # Synchroniser vers SQLite
-                        self.sync_stats = self.sync.sync_from_excel(
-                            self.excel_path,
-                            df_to_sync_renamed,
-                            force=force_reload
-                        )
-
-                        print(f"[OK] Sync terminee: {self.sync_stats['nb_inserted']} inserees, "
-                              f"{self.sync_stats['nb_deleted']} supprimees, "
-                              f"{self.sync_stats['nb_unchanged']} inchangees "
-                              f"(duree: {self.sync_stats['duration']:.2f}s)")
-
-                    else:
-                        print(f"[CACHE] Chargement depuis le cache SQLite: {reason}")
-                        self.sync_stats = {'status': 'cached', 'message': reason}
+                    self.sync_stats = self._synchroniser_sources(sources, force_reload)
 
                 # Charger depuis SQLite (beaucoup plus rapide)
                 df_from_cache = self.sync.load_to_dataframe()
@@ -183,11 +302,19 @@ class MarchesAnalyzer:
             else:
                 # Mode sans cache (chargement direct depuis Excel)
                 print("📂 Chargement direct depuis Excel (cache désactivé)")
-                self.df = pd.read_excel(self.excel_path)
+                sources = self.resoudre_sources(self.excel_path)
+                if not sources:
+                    print(f"[ERREUR] Aucun fichier source trouvé pour {self.excel_path!r}")
+                    return False
+                self.df = pd.concat(
+                    [pd.read_excel(source) for source in sources], ignore_index=True
+                ).drop_duplicates()
                 self.df_marches = self.df[
                     self.df.iloc[:, self.COL_MARCHE].notna() &
                     (self.df.iloc[:, self.COL_MARCHE] != '')
                 ].copy()
+                self.df_marches.iloc[:, self.COL_COMMANDE] = \
+                    self._resoudre_num_bdc(self.df_marches)
 
             return True
 
@@ -558,9 +685,21 @@ class MarchesAnalyzer:
         # Sinon, le marché est l'opération complète
         return normalized
 
-    def get_vision_operations(self) -> List[Dict]:
+    def invalider_vision(self):
+        """Oublie la vision par opération mémorisée.
+
+        À appeler après une écriture en base qui change les montants des
+        marchés (enveloppes, avenants, tranches).
+        """
+        self._vision_operations = None
+
+    def get_vision_operations(self, force_refresh: bool = False) -> List[Dict]:
         """
         Retourne la vision par opération (regroupement de marchés/lots).
+
+        Le résultat est mémorisé : il est recalculé une fois par opération lors
+        d'un traitement en lot, ce qui coûtait 27 s pour 77 opérations.
+        `invalider_vision()` ou un `load_data()` le remet à zéro.
 
         Retourne :
         - operation : code opération
@@ -574,6 +713,9 @@ class MarchesAnalyzer:
         - pourcent_consomme
         - nb_avenants_total
         """
+        if not force_refresh and self._vision_operations is not None:
+            return self._vision_operations
+
         vision_marches = self.get_vision_globale()
 
         if not vision_marches:
@@ -652,6 +794,7 @@ class MarchesAnalyzer:
         # Trier par opération
         results.sort(key=lambda x: x['operation'])
 
+        self._vision_operations = results
         return results
 
     def get_historique_factures(self, marche: str = None) -> List[Dict]:
@@ -1030,6 +1173,186 @@ class MarchesAnalyzer:
             print(f"Erreur lors de l'export Excel : {e}")
             return False
 
+    def _enveloppe_tranche(self, marche: str, tranche_libelle: str,
+                           montant_tranche: float,
+                           marches_totaux: Dict[str, float]) -> Tuple[float, str]:
+        """Enveloppe initiale d'un couple (marché, tranche), et sa provenance.
+
+        L'enveloppe est un paramètre : elle est lue en base (montant initial du
+        marché, tranches et avenants) et jamais reconstituée depuis les lignes
+        du fichier produit. Quand le marché n'est pas renseigné en base, on
+        retombe sur les montants initiaux de l'export SEDIT — la provenance est
+        alors signalée en clair dans l'en-tête, car le montant reste à saisir.
+
+        Args:
+            montant_tranche: montant initial de la tranche, déjà calculé.
+
+        Returns:
+            (montant, provenance) où provenance vaut ENVELOPPE_BASE,
+            ENVELOPPE_SEDIT ou ENVELOPPE_ABSENTE.
+        """
+        montant_marche = float(marches_totaux.get(marche, 0) or 0)
+        configure_en_base = montant_marche > 0
+
+        if tranche_libelle and montant_tranche > 0:
+            return montant_tranche, (
+                self.ENVELOPPE_BASE if configure_en_base else self.ENVELOPPE_SEDIT
+            )
+        if configure_en_base:
+            return montant_marche, self.ENVELOPPE_BASE
+        if montant_tranche > 0:
+            return montant_tranche, self.ENVELOPPE_SEDIT
+        return 0.0, self.ENVELOPPE_ABSENTE
+
+    def collecter_ecritures_operation(
+        self,
+        code_operation: str,
+        exercice_filter: Optional[str] = None
+    ) -> Tuple[Dict, Dict, Dict, Dict, Optional[Dict]]:
+        """Collecte les écritures SEDIT d'une opération, groupées par prestataire/tranche.
+
+        Source unique des onglets FINANCIER et « A jour » : les deux vues sont
+        produites à partir de ce même jeu de données, jamais de deux requêtes
+        indépendantes (c'était la cause de l'écart entre les deux onglets).
+
+        Returns:
+            (groupes, montants_declares, enveloppes, provenances, operation_info)
+            où `groupes` associe (fournisseur, tranche_libelle) à une liste
+            d'`Ecriture` et `provenances` la source de chaque enveloppe.
+        """
+        from collections import OrderedDict
+
+        operations_data = self.get_vision_operations()
+        operation_info = next(
+            (op for op in operations_data if op['operation'] == code_operation), None
+        )
+        if not operation_info:
+            print(f"Opération {code_operation} non trouvée")
+            return {}, {}, {}, {}, None
+
+        marches_operation = operation_info['marches']
+
+        # Montant de BDC déclaré, une valeur par n° de commande.
+        montants_declares: Dict[str, float] = {}
+        marches_types: Dict[str, str] = {}
+        if self.db:
+            cur = self.db.conn.cursor()
+            placeholders = ','.join('?' * len(marches_operation))
+            cur.execute(
+                f"""SELECT num_commande, SUM(montant_ttc) AS montant_total
+                    FROM commandes WHERE marche IN ({placeholders})
+                    GROUP BY num_commande""",
+                marches_operation
+            )
+            for row in cur.fetchall():
+                if row['num_commande']:
+                    montants_declares[str(row['num_commande']).strip()] = row['montant_total']
+
+            cur.execute(
+                f"""SELECT code_marche, type_marche FROM marches
+                    WHERE code_marche IN ({placeholders})""",
+                marches_operation
+            )
+            for row in cur.fetchall():
+                try:
+                    type_marche = row['type_marche'] if row['type_marche'] else 'CLASSIQUE'
+                except (KeyError, IndexError):
+                    type_marche = 'CLASSIQUE'
+                marches_types[row['code_marche']] = type_marche
+
+        # Enveloppe initiale de chaque marché, lue en base.
+        marches_totaux: Dict[str, float] = {}
+        if self.db:
+            for marche in marches_operation:
+                marches_totaux[marche] = self.db.get_montant_total_marche(marche)
+
+        groupes: "OrderedDict[Tuple[str, str], List[Ecriture]]" = OrderedDict()
+        enveloppes: Dict[Tuple[str, str], float] = {}
+        provenances: Dict[Tuple[str, str], str] = {}
+        marches_vus: Dict[Tuple[str, str], set] = {}
+
+        def _texte(row, col) -> str:
+            valeur = row.iloc[col]
+            return "" if pd.isna(valeur) else str(valeur).strip()
+
+        def _nombre(row, col) -> float:
+            valeur = row.iloc[col]
+            if pd.isna(valeur):
+                return 0.0
+            try:
+                return float(valeur)
+            except (TypeError, ValueError):
+                return 0.0
+
+        for marche in marches_operation:
+            df_marche = self.df_marches[self.df_marches.iloc[:, self.COL_MARCHE] == marche]
+            if len(df_marche) == 0:
+                continue
+
+            fournisseur = df_marche.iloc[0, self.COL_FOURNISSEUR]
+            fournisseur = "" if pd.isna(fournisseur) else str(fournisseur)
+            tranche = df_marche.iloc[0, self.COL_TRANCHE]
+
+            tranche_libelle = ""
+            if pd.notna(tranche):
+                try:
+                    tranche_num = int(float(tranche))
+                    tranche_libelle = "TF" if tranche_num == 0 else f"TO{tranche_num}"
+                except (TypeError, ValueError):
+                    tranche_libelle = str(tranche)
+
+            cle_groupe = (fournisseur, tranche_libelle)
+            groupes.setdefault(cle_groupe, [])
+
+            montant_initial_tranche = self.calculate_montant_initial_tranche(marche, tranche)
+
+            # L'enveloppe du groupe cumule celles de ses marchés distincts.
+            vus = marches_vus.setdefault(cle_groupe, set())
+            if marche not in vus:
+                vus.add(marche)
+                montant_enveloppe, provenance = self._enveloppe_tranche(
+                    marche, tranche_libelle, float(montant_initial_tranche or 0), marches_totaux
+                )
+                enveloppes[cle_groupe] = enveloppes.get(cle_groupe, 0.0) + montant_enveloppe
+                # La provenance la moins fiable du groupe l'emporte : mieux vaut
+                # signaler un doute que laisser croire à un montant contractuel.
+                courante = provenances.get(cle_groupe, self.ENVELOPPE_BASE)
+                if self.RANG_PROVENANCE[provenance] >= self.RANG_PROVENANCE[courante]:
+                    provenances[cle_groupe] = provenance
+
+            type_marche = marches_types.get(marche, 'CLASSIQUE')
+
+            for _, row in df_marche.iterrows():
+                num_commande = row.iloc[self.COL_COMMANDE]
+                num_commande = "" if pd.isna(num_commande) else str(num_commande).strip()
+
+                if exercice_filter and exercice_filter != "Tous":
+                    if self.extract_exercice_from_bdc(num_commande) != exercice_filter:
+                        continue
+
+                # Une ligne sans BDC est rattachée à sa tranche : le montant de
+                # référence est alors le montant initial de la tranche.
+                montant_initial = _nombre(row, self.COL_MONTANT_INITIAL)
+                if not num_commande and montant_initial <= 0:
+                    montant_initial = float(montant_initial_tranche or 0)
+
+                groupes[cle_groupe].append(Ecriture(
+                    marche=marche,
+                    fournisseur=fournisseur,
+                    tranche_libelle=tranche_libelle,
+                    num_commande=num_commande,
+                    libelle=_texte(row, self.COL_LIBELLE),
+                    num_facture=_texte(row, self.COL_FACTURE),
+                    num_mandat=_texte(row, self.COL_MANDAT),
+                    date_sf=_texte(row, self.COL_DATE_SF),
+                    montant_ttc=_nombre(row, self.COL_MONTANT_TTC),
+                    montant_sf=_nombre(row, self.COL_MONTANT_SF),
+                    montant_initial=montant_initial,
+                    type_marche=type_marche,
+                ))
+
+        return groupes, montants_declares, enveloppes, provenances, operation_info
+
     def export_suivi_financier_operation(
         self,
         code_operation: str,
@@ -1039,13 +1362,18 @@ class MarchesAnalyzer:
     ) -> bool:
         """
         Génère un fichier Excel de suivi financier pour une opération spécifique.
-        Format identique au modèle _Suivi_financier_op.xlsx.
+
+        Le tableau émet **une ligne par état de bon de commande**, pas une ligne
+        par écriture SEDIT : les factures mandatées telles quelles, plus une
+        unique ligne d'engagement portant le reliquat non facturé. Un BDC soldé
+        n'a plus de ligne d'engagement, et un report d'exercice ne crée plus de
+        second engagement.
 
         Args:
             code_operation: Code de l'opération (ex: "2024_1", "2024_17")
             filepath: Chemin du fichier Excel à créer
-            exercice_filter: Exercice à filtrer (ex: "2024") ou "Tous"/None pour tout exporter
-            special_export: Active la logique spécifique (ex: 2020_14G3P)
+            exercice_filter: Exercice à filtrer (ex: "2024") ou "Tous"/None
+            special_export: Trie les BDC par numéro et écrit un log de contrôle
 
         Returns:
             True si succès, False sinon
@@ -1054,94 +1382,75 @@ class MarchesAnalyzer:
             from openpyxl import Workbook
             from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
             from openpyxl.utils import get_column_letter
-            from datetime import datetime
+
+            groupes, montants_declares, enveloppes, provenances, operation_info = \
+                self.collecter_ecritures_operation(code_operation, exercice_filter)
+            if operation_info is None:
+                return False
+
+            # Agrégation : une ligne par état de BDC. Onglets FINANCIER,
+            # « A jour », « Anomalies » et « Lignes neutralisées » en découlent.
+            resultats: Dict[Tuple[str, str], ResultatSuivi] = {}
+            for cle_groupe, ecritures in groupes.items():
+                resultats[cle_groupe] = agreger_ecritures(
+                    ecritures, montants_declares, trier_par_bdc=special_export
+                )
+
+            global_resultat = ResultatSuivi()
+            for resultat in resultats.values():
+                global_resultat.etendre(resultat)
+            enveloppe_totale = sum(enveloppes.values())
+
+            # Provenance de l'enveloppe affichée : la moins fiable l'emporte.
+            sources = set(provenances.values())
+            if self.ENVELOPPE_ABSENTE in sources or not sources:
+                libelle_enveloppe = "Enveloppe initiale (NON RENSEIGNÉE EN BASE) :"
+            elif self.ENVELOPPE_SEDIT in sources:
+                libelle_enveloppe = (
+                    "Enveloppe initiale (reconstituée depuis l'export SEDIT — à saisir en base) :"
+                )
+            else:
+                libelle_enveloppe = "Enveloppe initiale (lue en base) :"
 
             wb = Workbook()
-            wb.remove(wb.active)  # Supprimer la feuille par défaut
+            wb.remove(wb.active)
 
-            # Styles
             header_font = Font(bold=True, size=11)
             header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
             header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
             border_thin = Border(
-                left=Side(style='thin'),
-                right=Side(style='thin'),
-                top=Side(style='thin'),
-                bottom=Side(style='thin')
+                left=Side(style='thin'), right=Side(style='thin'),
+                top=Side(style='thin'), bottom=Side(style='thin')
             )
-
-            # Filtrer les données pour l'opération
-            operations_data = self.get_vision_operations()
-            operation_info = next((op for op in operations_data if op['operation'] == code_operation), None)
-
-            if not operation_info:
-                print(f"Opération {code_operation} non trouvée")
-                return False
-
-            # Récupérer tous les marchés de l'opération
-            marches_operation = operation_info['marches']
-
-            # Charger les montants des commandes depuis la base de données
-            # pour pouvoir afficher le montant de chaque BDC
-            commandes_montants = {}
-            if self.db:
-                cur = self.db.conn.cursor()
-                # Récupérer toutes les commandes pour les marchés de cette opération
-                placeholders = ','.join('?' * len(marches_operation))
-                query = f"""
-                    SELECT num_commande, SUM(montant_ttc) as montant_total
-                    FROM commandes
-                    WHERE marche IN ({placeholders})
-                    GROUP BY num_commande
-                """
-                cur.execute(query, marches_operation)
-                for row in cur.fetchall():
-                    if row['num_commande']:
-                        commandes_montants[row['num_commande']] = row['montant_total']
-                print(f"[DEBUG] Chargé {len(commandes_montants)} montants de commandes")
-
-            # Charger les types de marchés
-            marches_types = {}
-            if self.db:
-                cur = self.db.conn.cursor()
-                placeholders = ','.join('?' * len(marches_operation))
-                query = f"""
-                    SELECT code_marche, type_marche
-                    FROM marches
-                    WHERE code_marche IN ({placeholders})
-                """
-                cur.execute(query, marches_operation)
-                for row in cur.fetchall():
-                    try:
-                        type_marche = row['type_marche'] if row['type_marche'] else 'CLASSIQUE'
-                    except (KeyError, IndexError):
-                        type_marche = 'CLASSIQUE'
-                    marches_types[row['code_marche']] = type_marche
-                print(f"[DEBUG] Chargé {len(marches_types)} types de marchés")
-
-            is_target_operation = special_export and code_operation == "2020_14G3P"
-
-            # Charger les montants totaux des marchés (plafond pour BDC)
-            marches_totaux = {}
-            if self.db:
-                for marche in marches_operation:
-                    marches_totaux[marche] = self.db.get_montant_total_marche(marche)
+            fill_gray = PatternFill(start_color="E8E8E8", end_color="E8E8E8", fill_type="solid")
+            fill_white = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
+            fill_subtotal = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
+            fill_engagement = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+            font_subtotal = Font(bold=True, size=11)
+            border_thick = Border(
+                left=Side(style='thick'), right=Side(style='thick'),
+                top=Side(style='thick'), bottom=Side(style='thick')
+            )
+            format_euro = '#,##0.00 €'
 
             # ===============================
             # FEUILLE 1 : FINANCIER
             # ===============================
             ws_financier = wb.create_sheet("FINANCIER")
 
-            # Titre de l'opération
             ws_financier.cell(1, 1, f"SUIVI FINANCIER OPÉRATION {code_operation}")
             ws_financier.cell(1, 1).font = Font(bold=True, size=14)
-            ws_financier.merge_cells('A1:N1')
+            ws_financier.merge_cells('A1:O1')
 
-            # Informations opération
             ws_financier.cell(2, 1, f"Libellé: {operation_info.get('libelle', '')}")
             ws_financier.cell(3, 1, f"Fournisseurs: {operation_info.get('fournisseur', '')}")
+            # L'enveloppe initiale est écrite en clair : elle ne doit plus se
+            # déduire d'une addition de cellules du tableau.
+            ws_financier.cell(4, 1, libelle_enveloppe)
+            ws_financier.cell(4, 1).font = Font(bold=True)
+            ws_financier.cell(4, 6, enveloppe_totale).number_format = format_euro
+            ws_financier.cell(4, 6).font = Font(bold=True)
 
-            # En-têtes (ligne 5)
             headers = [
                 "TYPE\nINTERVENTION",
                 "DESIGNATION",
@@ -1156,8 +1465,11 @@ class MarchesAnalyzer:
                 "MONTANT FACTURE YC mandataire révision TTC",
                 "MONTANT FACTURE PAR BDC YC révision-AF-RETGAR TTC",
                 "MONTANT FACTURE PAR BDC HORS révision TTC",
-                "MONTANT RESTANT SUR BDC Hors rev / engagement TTC"
+                "MONTANT RESTANT SUR BDC Hors rev / engagement TTC",
+                "STATUT",
             ]
+            nb_colonnes = len(headers)
+            colonnes_euro = [6, 10, 11, 12, 13, 14]
 
             for col_idx, header in enumerate(headers, 1):
                 cell = ws_financier.cell(5, col_idx, header)
@@ -1166,263 +1478,105 @@ class MarchesAnalyzer:
                 cell.alignment = header_alignment
                 cell.border = border_thin
 
-            # Organiser les données par (prestataire, tranche)
-            # Collecter d'abord toutes les données
-            from collections import defaultdict
-
-            data_by_prestataire_tranche = defaultdict(list)
-
-            for marche in marches_operation:
-                df_marche = self.df_marches[self.df_marches.iloc[:, self.COL_MARCHE] == marche]
-                if len(df_marche) == 0:
-                    continue
-
-                fournisseur = df_marche.iloc[0, self.COL_FOURNISSEUR] if not df_marche.iloc[0, self.COL_FOURNISSEUR] is pd.NA else ""
-                tranche = df_marche.iloc[0, self.COL_TRANCHE] if not df_marche.iloc[0, self.COL_TRANCHE] is pd.NA else ""
-
-                # Récupérer le type de marché
-                type_marche = marches_types.get(marche, 'CLASSIQUE')
-
-                # Formater la tranche
-                tranche_libelle = ""
-                if pd.notna(tranche):
-                    try:
-                        tranche_num = int(float(tranche))
-                        tranche_libelle = "TF" if tranche_num == 0 else f"TO{tranche_num}"
-                    except:
-                        tranche_libelle = str(tranche)
-
-                montant_initial_tranche = self.calculate_montant_initial_tranche(marche, tranche)
-
-                for idx, row in df_marche.iterrows():
-                    # Extraire le N° de commande (qui est dans COL_COMMANDE)
-                    num_commande = row.iloc[self.COL_COMMANDE] if not pd.isna(row.iloc[self.COL_COMMANDE]) else ""
-                    if is_target_operation:
-                        exercice = self.extract_exercice_from_bdc(num_commande)
-                        if exercice_filter and exercice_filter != "Tous" and exercice != exercice_filter:
-                            continue
-
-                    # Récupérer le montant de la commande depuis le dictionnaire
-                    montant_commande = commandes_montants.get(num_commande, 0) if num_commande else 0
-
-                    data_by_prestataire_tranche[(fournisseur, tranche_libelle)].append({
-                        'marche': marche,
-                        'type_marche': type_marche,
-                        'fournisseur': fournisseur,
-                        'tranche_libelle': tranche_libelle,
-                        'montant_initial_tranche': montant_initial_tranche,
-                        'num_commande': num_commande,
-                        'montant_commande': montant_commande,
-                        'num_facture': row.iloc[self.COL_FACTURE] if not pd.isna(row.iloc[self.COL_FACTURE]) else "",
-                        'montant_sf': float(row.iloc[self.COL_MONTANT_SF]) if not pd.isna(row.iloc[self.COL_MONTANT_SF]) else 0,
-                        'montant_ttc': float(row.iloc[self.COL_MONTANT_TTC]) if not pd.isna(row.iloc[self.COL_MONTANT_TTC]) else 0,
-                        'num_mandat': row.iloc[self.COL_MANDAT] if not pd.isna(row.iloc[self.COL_MANDAT]) else "",
-                        'date_sf': row.iloc[self.COL_DATE_SF] if not pd.isna(row.iloc[self.COL_DATE_SF]) else "",
-                        'libelle': row.iloc[self.COL_LIBELLE] if not pd.isna(row.iloc[self.COL_LIBELLE]) else ""
-                    })
-
-            # Styles pour alternance et sous-totaux
-            fill_gray = PatternFill(start_color="E8E8E8", end_color="E8E8E8", fill_type="solid")
-            fill_white = PatternFill(start_color="FFFFFF", end_color="FFFFFF", fill_type="solid")
-            fill_subtotal = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
-            font_subtotal = Font(bold=True, size=11)
-            border_thick = Border(
-                left=Side(style='thick'),
-                right=Side(style='thick'),
-                top=Side(style='thick'),
-                bottom=Side(style='thick')
-            )
-
-            # Écrire les données avec alternance et sous-totaux
-            row_idx = 6
-            current_prestataire = None
-            color_index = 0
-
-            restant_courant = None
             log_file = None
-            if is_target_operation:
+            if special_export:
                 import os
-                log_path = os.path.join("run_logs", "export_2020_14G3P.log")
+                os.makedirs("run_logs", exist_ok=True)
+                log_path = os.path.join("run_logs", f"export_{code_operation}.log")
                 log_file = open(log_path, "w", encoding="utf-8")
-                log_file.write("ligne;marche;bdc;facture;plafond;montant_ttc;restant\n")
+                log_file.write("ligne;marche;bdc;facture;statut;enveloppe;montant_impute;restant\n")
 
-            for (fournisseur, tranche_libelle), factures in sorted(data_by_prestataire_tranche.items()):
-                # Changer de couleur si changement de prestataire
+            row_idx = 6
+            color_index = 0
+            current_prestataire = None
+
+            for (fournisseur, tranche_libelle), resultat in resultats.items():
                 if current_prestataire != fournisseur:
                     current_prestataire = fournisseur
                     color_index += 1
-
                 current_fill = fill_gray if color_index % 2 == 1 else fill_white
-                if is_target_operation:
-                    factures = sorted(
-                        factures,
-                        key=lambda x: (x['num_commande'] or "", x['num_facture'] or "")
-                    )
 
-                # Accumulateurs pour sous-totaux
-                subtotal_montant_initial = 0
-                subtotal_montant_bdc_ou_tranche = 0  # Accumule les valeurs réelles de la colonne 7
-                subtotal_montant_ht = 0
-                subtotal_montant_ttc = 0
-                subtotal_par_bdc = 0
-                first_row_of_group = row_idx
-                previous_bdc = None  # Pour détecter les changements de BDC
+                enveloppe = enveloppes.get((fournisseur, tranche_libelle), 0.0)
+                # Solde glissant : un seul mode de calcul, l'enveloppe initiale
+                # moins le cumul des montants imputés depuis le début du groupe.
+                cumul_impute = 0.0
 
-                # Écrire chaque facture
-                for facture in factures:
-                    montant_ttc = facture['montant_ttc']
-                    montant_ht = montant_ttc / 1.2 if montant_ttc > 0 else facture['montant_sf'] / 1.2
+                for ligne in resultat.lignes:
+                    cumul_impute += ligne.montant_impute
+                    restant = enveloppe - cumul_impute
 
-                    # Données de la ligne
                     ws_financier.cell(row_idx, 1, "TRAVAUX")
-                    ws_financier.cell(row_idx, 2, facture['libelle'][:50])
-                    ws_financier.cell(row_idx, 3, facture['marche'])
-                    ws_financier.cell(row_idx, 4, facture['fournisseur'])
-                    # Colonne 5: N° BDC (commande) ou Tranche
-                    bdc_ou_tranche = facture['num_commande'] if facture['num_commande'] else facture['tranche_libelle']
-                    ws_financier.cell(row_idx, 5, bdc_ou_tranche)
-                    # Colonne 6: Montant TTC BDC (si BDC avec montant) ou Montant initial tranche (si tranche) ou Montant TTC facture (fallback)
-                    if facture['num_commande'] and facture['montant_commande'] > 0:
-                        # BDC avec montant trouvé
-                        montant_bdc_ou_tranche = facture['montant_commande']
-                    elif not facture['num_commande'] and row_idx == first_row_of_group:
-                        # Tranche (première ligne du groupe)
-                        montant_bdc_ou_tranche = facture['montant_initial_tranche']
-                    elif facture['num_commande'] and facture['montant_commande'] == 0:
-                        # BDC sans montant trouvé -> utiliser le montant TTC de la facture (fallback)
-                        montant_bdc_ou_tranche = montant_ttc
-                    else:
-                        montant_bdc_ou_tranche = ""
-                    ws_financier.cell(row_idx, 6, montant_bdc_ou_tranche)
-                    ws_financier.cell(row_idx, 7, facture['num_facture'])
-                    ws_financier.cell(row_idx, 8, facture['num_mandat'])
-                    ws_financier.cell(row_idx, 9, facture['date_sf'])  # Date de service fait
-                    ws_financier.cell(row_idx, 10, montant_ht)
-                    ws_financier.cell(row_idx, 11, montant_ttc)
-                    ws_financier.cell(row_idx, 12, montant_ttc)
-                    ws_financier.cell(row_idx, 13, montant_ttc)
+                    ws_financier.cell(row_idx, 2, ligne.designation)
+                    ws_financier.cell(row_idx, 3, ligne.marche)
+                    ws_financier.cell(row_idx, 4, ligne.fournisseur)
+                    ws_financier.cell(row_idx, 5, ligne.cle_bdc)
+                    # Colonne 6 : toujours le montant de référence du BDC,
+                    # identique sur toutes ses lignes. Jamais un montant de facture.
+                    ws_financier.cell(row_idx, 6, ligne.montant_ref)
+                    ws_financier.cell(row_idx, 7, ligne.num_facture)
+                    ws_financier.cell(row_idx, 8, ligne.num_mandat)
+                    ws_financier.cell(row_idx, 9, ligne.date_sf)
+                    ws_financier.cell(row_idx, 10, ligne.montant_ht)
+                    ws_financier.cell(row_idx, 11, ligne.montant_impute)
+                    ws_financier.cell(row_idx, 12, ligne.montant_impute)
+                    ws_financier.cell(row_idx, 13, ligne.montant_impute)
+                    ws_financier.cell(row_idx, 14, restant)
+                    ws_financier.cell(row_idx, 15, ligne.statut)
 
-                    # Calculer le restant
-                    type_marche = facture['type_marche']
-                    current_bdc = facture['num_commande']
+                    ligne_fill = fill_engagement if ligne.statut == STATUT_ENGAGEMENT else current_fill
+                    for col in range(1, nb_colonnes + 1):
+                        ws_financier.cell(row_idx, col).fill = ligne_fill
+                    for col in colonnes_euro:
+                        ws_financier.cell(row_idx, col).number_format = format_euro
 
-                    if is_target_operation:
-                        montant_plafond = marches_totaux.get(facture['marche'], 0) or 0
-                        if montant_plafond == 0:
-                            montant_plafond = 4175726
-                        montant_facture_ttc = montant_ttc
-                        if restant_courant is None:
-                            restant_courant = montant_plafond - montant_facture_ttc
-                            if row_idx == first_row_of_group:
-                                subtotal_montant_initial = montant_plafond
-                        else:
-                            restant_courant -= montant_facture_ttc
-                        ws_financier.cell(row_idx, 14, restant_courant)
-                        if log_file:
-                            log_file.write(
-                                f"{row_idx};{facture['marche']};{bdc_ou_tranche};{facture['num_facture']};"
-                                f"{montant_plafond};{montant_facture_ttc};{restant_courant}\n"
-                            )
-                    else:
-                        # Déterminer si on doit réinitialiser le restant
-                        reset_restant = False
-                        if row_idx == first_row_of_group:
-                            # Première ligne du groupe : toujours réinitialiser
-                            reset_restant = True
-                        elif type_marche == 'BDC' and current_bdc and current_bdc != previous_bdc:
-                            # Marché à BDC : réinitialiser quand le N° de BDC change
-                            reset_restant = True
-                        elif type_marche != 'BDC' and current_bdc and current_bdc != previous_bdc:
-                            # Marché classique : réinitialiser quand le N° de BDC change
-                            reset_restant = True
-
-                        if reset_restant:
-                            # Réinitialiser : utiliser le montant de la colonne 7 comme montant de départ
-                            montant_depart = float(montant_bdc_ou_tranche) if montant_bdc_ou_tranche != "" else 0
-                            restant = montant_depart - montant_ttc
-                            ws_financier.cell(row_idx, 14, restant)
-                            if row_idx == first_row_of_group:
-                                subtotal_montant_initial = montant_depart
-                        else:
-                            # Continuer : déduire du restant précédent
-                            prev_restant = ws_financier.cell(row_idx - 1, 14).value or 0
-                            restant = prev_restant - montant_ttc
-                            ws_financier.cell(row_idx, 14, restant)
-
-                    # Mettre à jour le BDC précédent
-                    previous_bdc = current_bdc
-
-                    # Appliquer la couleur d'alternance
-                    for col in range(1, 15):
-                        ws_financier.cell(row_idx, col).fill = current_fill
-
-                    # Format numérique
-                    for col in [6, 10, 11, 12, 13, 14]:
-                        ws_financier.cell(row_idx, col).number_format = '#,##0.00 €'
-
-                    # Accumuler pour sous-totaux
-                    subtotal_montant_ht += montant_ht
-                    subtotal_montant_ttc += montant_ttc
-                    subtotal_par_bdc += montant_ttc
-                    # Accumuler le montant BDC ou Tranche (colonne 7) seulement si ce n'est pas une chaîne vide
-                    if montant_bdc_ou_tranche != "":
-                        subtotal_montant_bdc_ou_tranche += float(montant_bdc_ou_tranche) if montant_bdc_ou_tranche else 0
+                    if log_file:
+                        log_file.write(
+                            f"{row_idx};{ligne.marche};{ligne.cle_bdc};{ligne.num_facture};"
+                            f"{ligne.statut};{enveloppe};{ligne.montant_impute};{restant}\n"
+                        )
 
                     row_idx += 1
 
-                # Insérer ligne de sous-total
-                ws_financier.cell(row_idx, 1, "")
+                # Sous-total du groupe.
+                total_impute = resultat.total_impute
                 ws_financier.cell(row_idx, 2, f"Sous-total Tranche {tranche_libelle} - {fournisseur}")
-                ws_financier.cell(row_idx, 2).font = font_subtotal
-                ws_financier.cell(row_idx, 3, "")
-                ws_financier.cell(row_idx, 4, "")
-                ws_financier.cell(row_idx, 5, "")
-                ws_financier.cell(row_idx, 6, subtotal_montant_bdc_ou_tranche)  # Utilise l'accumulateur réel
-                ws_financier.cell(row_idx, 7, "")
-                ws_financier.cell(row_idx, 8, "")
-                ws_financier.cell(row_idx, 9, "")  # Date de service fait (vide pour sous-total)
-                ws_financier.cell(row_idx, 10, subtotal_montant_ht)
-                ws_financier.cell(row_idx, 11, subtotal_montant_ttc)
-                ws_financier.cell(row_idx, 12, subtotal_par_bdc)
-                ws_financier.cell(row_idx, 13, subtotal_par_bdc)
-                ws_financier.cell(row_idx, 14, subtotal_montant_bdc_ou_tranche - subtotal_par_bdc)  # Utilise l'accumulateur réel
+                # Somme sur BDC distincts, jamais une somme de colonne.
+                ws_financier.cell(row_idx, 6, resultat.total_bdc_distincts)
+                ws_financier.cell(row_idx, 10, sum(l.montant_ht for l in resultat.lignes))
+                ws_financier.cell(row_idx, 11, total_impute)
+                ws_financier.cell(row_idx, 12, total_impute)
+                ws_financier.cell(row_idx, 13, total_impute)
+                # Même formule que le glissant : la dernière valeur de la
+                # colonne N et ce sous-total sont nécessairement égaux.
+                ws_financier.cell(row_idx, 14, enveloppe - total_impute)
+                ws_financier.cell(row_idx, 15, "TOTAL")
 
-                # Mise en forme du sous-total
-                for col in range(1, 15):
+                for col in range(1, nb_colonnes + 1):
                     cell = ws_financier.cell(row_idx, col)
                     cell.fill = fill_subtotal
                     cell.font = font_subtotal
                     cell.border = border_thick
-
-                # Format numérique pour sous-total
-                for col in [6, 10, 11, 12, 13, 14]:
-                    ws_financier.cell(row_idx, col).number_format = '#,##0.00 €'
+                for col in colonnes_euro:
+                    ws_financier.cell(row_idx, col).number_format = format_euro
 
                 row_idx += 1
 
-            # Ajuster les largeurs
-            ws_financier.column_dimensions['A'].width = 12  # Type
-            ws_financier.column_dimensions['B'].width = 25  # Désignation
-            ws_financier.column_dimensions['C'].width = 20  # N° Marché
-            ws_financier.column_dimensions['D'].width = 25  # Nom Prestataire
-            ws_financier.column_dimensions['E'].width = 15  # Tranche
-            ws_financier.column_dimensions['F'].width = 15  # Montant BDC
-            ws_financier.column_dimensions['G'].width = 15  # N° Facture
-            ws_financier.column_dimensions['H'].width = 12  # N° Mandat
-            ws_financier.column_dimensions['I'].width = 12  # Date de service fait
-            for col in ['J', 'K', 'L', 'M', 'N']:
-                ws_financier.column_dimensions[col].width = 14
+            largeurs = [12, 40, 20, 25, 15, 15, 15, 12, 12, 14, 14, 14, 14, 14, 32]
+            for col_idx, largeur in enumerate(largeurs, 1):
+                ws_financier.column_dimensions[get_column_letter(col_idx)].width = largeur
 
             # ===============================
-            # FEUILLE 2 : A JOUR (vue synthétique)
+            # FEUILLE 2 : A JOUR (une ligne par BDC)
             # ===============================
             ws_ajour = wb.create_sheet("A jour")
 
-            # Titre
             ws_ajour.cell(1, 1, f"OPÉRATION {code_operation}")
             ws_ajour.cell(1, 1).font = Font(bold=True, size=14)
+            ws_ajour.cell(2, 1, libelle_enveloppe)
+            ws_ajour.cell(2, 1).font = Font(bold=True)
+            ws_ajour.cell(2, 6, enveloppe_totale).number_format = format_euro
+            ws_ajour.cell(2, 6).font = Font(bold=True)
 
-            # En-têtes (ligne 4)
             headers_ajour = [
                 "TYPE INTERVENTION",
                 "DESIGNATION",
@@ -1430,10 +1584,10 @@ class MarchesAnalyzer:
                 "NOM PRESTATAIRE",
                 "N° BDC ou Tranche (TF ou TO)",
                 "MONTANT TTC BDC ou Tranche",
-                "MONTANT FACTURE PAR BDC YC révision TTC",
-                "MONTANT RESTANT SUR BDC TTC"
+                "MONTANT FACTURÉ TTC",
+                "RELIQUAT NON FACTURÉ TTC",
+                "ÉTAT",
             ]
-
             for col_idx, header in enumerate(headers_ajour, 1):
                 cell = ws_ajour.cell(4, col_idx, header)
                 cell.font = header_font
@@ -1441,63 +1595,117 @@ class MarchesAnalyzer:
                 cell.alignment = header_alignment
                 cell.border = border_thin
 
-            # Données par tranche
             row_idx = 5
-            for marche in marches_operation:
-                df_marche = self.df_marches[self.df_marches.iloc[:, self.COL_MARCHE] == marche]
-                if len(df_marche) == 0:
-                    continue
-
-                tranche = df_marche.iloc[0, self.COL_TRANCHE]
-                tranche_libelle = ""
-                if pd.notna(tranche):
-                    try:
-                        tranche_num = int(float(tranche))
-                        tranche_libelle = "TF" if tranche_num == 0 else f"TO{tranche_num}"
-                    except:
-                        tranche_libelle = str(tranche)
-
-                montant_initial = self.calculate_montant_initial_tranche(marche, tranche)
-                service_fait = self.calculate_service_fait_tranche(marche, tranche)
-                paye = self.calculate_paye_tranche(marche, tranche)
-                restant = montant_initial - paye
-
-                fournisseur = df_marche.iloc[0, self.COL_FOURNISSEUR]
-
+            for bdc in global_resultat.bdcs:
                 ws_ajour.cell(row_idx, 1, "TRAVAUX")
-                ws_ajour.cell(row_idx, 2, "")
-                ws_ajour.cell(row_idx, 3, marche)
-                ws_ajour.cell(row_idx, 4, fournisseur if pd.notna(fournisseur) else "")
-                ws_ajour.cell(row_idx, 5, tranche_libelle)
-                ws_ajour.cell(row_idx, 6, montant_initial)
-                ws_ajour.cell(row_idx, 7, paye)
-                ws_ajour.cell(row_idx, 8, restant)
-
-                # Format numérique
+                ws_ajour.cell(row_idx, 2, bdc.designation)
+                ws_ajour.cell(row_idx, 3, bdc.marche)
+                ws_ajour.cell(row_idx, 4, bdc.fournisseur)
+                ws_ajour.cell(row_idx, 5, bdc.cle_bdc)
+                ws_ajour.cell(row_idx, 6, bdc.montant_ref)
+                ws_ajour.cell(row_idx, 7, bdc.montant_facture)
+                ws_ajour.cell(row_idx, 8, bdc.reliquat)
+                ws_ajour.cell(row_idx, 9, bdc.etat)
                 for col in [6, 7, 8]:
-                    ws_ajour.cell(row_idx, col).number_format = '#,##0.00 €'
-
+                    ws_ajour.cell(row_idx, col).number_format = format_euro
                 row_idx += 1
 
-            # Totaux
             ws_ajour.cell(row_idx, 5, "TOTAL")
             ws_ajour.cell(row_idx, 5).font = Font(bold=True)
-            for col in [6, 7, 8]:
-                formula = f"=SUM({get_column_letter(col)}5:{get_column_letter(col)}{row_idx-1})"
-                cell = ws_ajour.cell(row_idx, col, formula)
+            # Totaux issus du même DataFrame que l'onglet FINANCIER : l'égalité
+            # avec ses sous-totaux est structurelle, pas fortuite.
+            for col, valeur in (
+                (6, global_resultat.total_bdc_distincts),
+                (7, global_resultat.total_facture),
+                (8, global_resultat.total_engagement),
+            ):
+                cell = ws_ajour.cell(row_idx, col, valeur)
                 cell.font = Font(bold=True)
-                cell.number_format = '#,##0.00 €'
+                cell.number_format = format_euro
 
-            # Ajuster largeurs
-            for col_idx, width in enumerate([12, 25, 20, 25, 15, 18, 18, 18], 1):
-                ws_ajour.column_dimensions[get_column_letter(col_idx)].width = width
+            for col_idx, largeur in enumerate([12, 40, 20, 25, 15, 18, 18, 18, 24], 1):
+                ws_ajour.column_dimensions[get_column_letter(col_idx)].width = largeur
+
+            # ===============================
+            # FEUILLE 3 : ANOMALIES
+            # ===============================
+            ws_anomalies = wb.create_sheet("Anomalies")
+            ws_anomalies.cell(1, 1, "ANOMALIES À ARBITRER")
+            ws_anomalies.cell(1, 1).font = Font(bold=True, size=14)
+            for col_idx, header in enumerate(
+                ["N° MARCHÉ", "N° BDC", "ANOMALIE", "VALEURS RENCONTRÉES", "VALEUR RETENUE"], 1
+            ):
+                cell = ws_anomalies.cell(3, col_idx, header)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = header_alignment
+                cell.border = border_thin
+
+            row_idx = 4
+            for anomalie in global_resultat.anomalies:
+                ws_anomalies.cell(row_idx, 1, anomalie.marche)
+                ws_anomalies.cell(row_idx, 2, anomalie.cle_bdc)
+                ws_anomalies.cell(row_idx, 3, anomalie.message)
+                ws_anomalies.cell(row_idx, 4, anomalie.valeurs)
+                ws_anomalies.cell(row_idx, 5, anomalie.valeur_retenue).number_format = format_euro
+                row_idx += 1
+
+            for col_idx, largeur in enumerate([20, 15, 55, 35, 18], 1):
+                ws_anomalies.column_dimensions[get_column_letter(col_idx)].width = largeur
+
+            # ===============================
+            # FEUILLE 4 : LIGNES NEUTRALISÉES
+            # ===============================
+            ws_neutral = wb.create_sheet("Lignes neutralisées")
+            ws_neutral.cell(1, 1, "LIGNES NEUTRALISÉES PAR L'AGRÉGATION")
+            ws_neutral.cell(1, 1).font = Font(bold=True, size=14)
+            for col_idx, header in enumerate(
+                ["N° MARCHÉ", "N° BDC", "DÉSIGNATION D'ORIGINE", "MONTANT D'ORIGINE",
+                 "MONTANT RETENU", "MONTANT NEUTRALISÉ", "MOTIF"], 1
+            ):
+                cell = ws_neutral.cell(3, col_idx, header)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = header_alignment
+                cell.border = border_thin
+
+            row_idx = 4
+            for neutralisation in global_resultat.neutralisations:
+                ws_neutral.cell(row_idx, 1, neutralisation.marche)
+                ws_neutral.cell(row_idx, 2, neutralisation.cle_bdc)
+                ws_neutral.cell(row_idx, 3, neutralisation.designation)
+                ws_neutral.cell(row_idx, 4, neutralisation.montant_origine)
+                ws_neutral.cell(row_idx, 5, neutralisation.montant_retenu)
+                ws_neutral.cell(row_idx, 6, neutralisation.montant_neutralise)
+                ws_neutral.cell(row_idx, 7, neutralisation.motif)
+                for col in [4, 5, 6]:
+                    ws_neutral.cell(row_idx, col).number_format = format_euro
+                row_idx += 1
+
+            ws_neutral.cell(row_idx, 3, "TOTAL")
+            ws_neutral.cell(row_idx, 3).font = Font(bold=True)
+            for col, valeur in (
+                (4, sum(n.montant_origine for n in global_resultat.neutralisations)),
+                (5, sum(n.montant_retenu for n in global_resultat.neutralisations)),
+                (6, sum(n.montant_neutralise for n in global_resultat.neutralisations)),
+            ):
+                cell = ws_neutral.cell(row_idx, col, valeur)
+                cell.font = Font(bold=True)
+                cell.number_format = format_euro
+
+            for col_idx, largeur in enumerate([20, 15, 45, 18, 18, 18, 60], 1):
+                ws_neutral.column_dimensions[get_column_letter(col_idx)].width = largeur
 
             if log_file:
                 log_file.close()
 
-            # Sauvegarder
             wb.save(filepath)
-            print(f"[OK] Export suivi financier operation {code_operation} : {filepath}")
+            print(
+                f"[OK] Export suivi financier operation {code_operation} : {filepath} "
+                f"({len(global_resultat.lignes)} lignes, "
+                f"{global_resultat.total_impute:.2f} € imputés, "
+                f"{len(global_resultat.neutralisations)} lignes neutralisées)"
+            )
             return True
 
         except Exception as e:
