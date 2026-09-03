@@ -24,6 +24,7 @@ from PyQt5.QtCore import (
     QTimer,
     QTime,
     QEvent,
+    pyqtSignal,
 )
 from PyQt5.QtGui import QIcon, QBrush, QColor, QFont, QStandardItemModel, QStandardItem
 from PyQt5.QtWidgets import (
@@ -55,6 +56,9 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QLineEdit,
     QCheckBox,    QTimeEdit,
+    QFrame,
+    QListView,
+    QAbstractItemView,
  )
 
 
@@ -200,6 +204,176 @@ class CheckableComboBox(QComboBox):
             return checked[0]
         else:
             return f"{len(checked)} sélectionnés"
+
+
+class _ProxyToujoursTous(QSortFilterProxyModel):
+    """Proxy de recherche qui laisse toujours passer la ligne « [Tous] ».
+
+    Sans ça, taper du texte dans la recherche ferait disparaître l'option
+    « tout cocher/décocher » dès qu'elle ne correspond plus au texte tapé.
+    """
+
+    def filterAcceptsRow(self, source_row, source_parent):
+        if source_row == 0:
+            return True
+        return super().filterAcceptsRow(source_row, source_parent)
+
+
+class SearchableCheckableComboBox(QComboBox):
+    """ComboBox à sélection multiple (cases à cocher) avec recherche live.
+
+    Une liste plate à cases à cocher (cf. CheckableComboBox) devient illisible
+    au-delà d'une quinzaine d'items : c'est le cas de Marché (une centaine de
+    valeurs) et Fournisseur (une bonne centaine aussi). Ce widget ajoute un
+    champ de recherche en tête d'une popup personnalisée qui filtre la liste
+    en direct, tout en gardant les mêmes cases à cocher.
+
+    La popup par défaut d'un QComboBox ne permet pas d'insérer un widget de
+    recherche au-dessus de la liste : on la remplace donc entièrement par une
+    QFrame(Qt.Popup) contenant le champ de recherche et une QListView, plutôt
+    que de bricoler la popup interne de Qt.
+
+    API compatible avec CheckableComboBox : addItem(s), clear(),
+    checked_items(), clear_selection(), currentText(). `selectionChanged` est
+    émis (sans argument) à chaque coche/décoche.
+    """
+
+    selectionChanged = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        self._add_tous_item()
+
+        self._proxy = _ProxyToujoursTous(self)
+        self._proxy.setSourceModel(self._model)
+        self._proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
+
+        self._popup = QFrame(self, Qt.Popup)
+        self._popup.setFrameShape(QFrame.StyledPanel)
+        self._popup.setStyleSheet(
+            "QFrame { background-color: white; border: 1px solid #808080; }"
+        )
+        popup_layout = QVBoxLayout(self._popup)
+        popup_layout.setContentsMargins(4, 4, 4, 4)
+        popup_layout.setSpacing(4)
+
+        self._search = QLineEdit(self._popup)
+        self._search.setPlaceholderText("Rechercher...")
+        self._search.setClearButtonEnabled(True)
+        popup_layout.addWidget(self._search)
+
+        self._list = QListView(self._popup)
+        self._list.setModel(self._proxy)
+        self._list.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._list.setUniformItemSizes(True)
+        popup_layout.addWidget(self._list)
+
+        self._search.textChanged.connect(self._on_search_changed)
+        self._list.pressed.connect(self._on_item_pressed)
+
+    def _add_tous_item(self):
+        item = QStandardItem("[Tous]")
+        item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        item.setCheckState(Qt.Unchecked)
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+        self._model.insertRow(0, item)
+
+    def _on_search_changed(self, texte):
+        self._proxy.setFilterFixedString(texte)
+
+    def _on_item_pressed(self, proxy_index):
+        source_index = self._proxy.mapToSource(proxy_index)
+        item = self._model.itemFromIndex(source_index)
+        if not item or not item.isCheckable():
+            return
+
+        if source_index.row() == 0:
+            # [Tous] coche/décoche l'intégralité des items, y compris ceux que
+            # la recherche masque actuellement : un « tout sélectionner » qui
+            # dépendrait du texte tapé serait surprenant.
+            nouvel_etat = Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked
+            item.setCheckState(nouvel_etat)
+            for i in range(1, self._model.rowCount()):
+                autre = self._model.item(i, 0)
+                if autre:
+                    autre.setCheckState(nouvel_etat)
+        else:
+            item.setCheckState(Qt.Unchecked if item.checkState() == Qt.Checked else Qt.Checked)
+            self._update_tous_item()
+
+        self.selectionChanged.emit()
+
+    def _update_tous_item(self):
+        tous = self._model.item(0, 0)
+        if not tous:
+            return
+        tout_coche = self._model.rowCount() > 1
+        au_moins_un = False
+        for i in range(1, self._model.rowCount()):
+            item = self._model.item(i, 0)
+            if item:
+                if item.checkState() == Qt.Checked:
+                    au_moins_un = True
+                else:
+                    tout_coche = False
+        tous.setCheckState(Qt.Checked if (tout_coche and au_moins_un) else Qt.Unchecked)
+
+    def checked_items(self):
+        """Liste des items cochés, hors [Tous]."""
+        checked = []
+        for i in range(1, self._model.rowCount()):
+            item = self._model.item(i, 0)
+            if item and item.checkState() == Qt.Checked:
+                checked.append(item.text())
+        return checked
+
+    def clear_selection(self):
+        for i in range(self._model.rowCount()):
+            item = self._model.item(i, 0)
+            if item:
+                item.setCheckState(Qt.Unchecked)
+
+    def addItem(self, text):
+        item = QStandardItem(text)
+        item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled)
+        item.setCheckState(Qt.Unchecked)
+        self._model.appendRow(item)
+
+    def addItems(self, texts):
+        for text in texts:
+            self.addItem(text)
+
+    def clear(self):
+        self._model.clear()
+        self._add_tous_item()
+
+    def currentText(self):
+        checked = self.checked_items()
+        if not checked:
+            return "Aucun"
+        elif len(checked) == 1:
+            return checked[0]
+        return f"{len(checked)} sélectionnés"
+
+    def showPopup(self):
+        """Affiche la popup personnalisée (recherche + liste) au lieu de la
+        popup par défaut d'un QComboBox, qui ne peut pas héberger de champ de
+        recherche au-dessus de sa liste."""
+        self._search.clear()
+        largeur = max(self.width(), 280)
+        hauteur_liste = min(320, max(120, 24 * min(self._model.rowCount(), 12)))
+        self._popup.resize(largeur, hauteur_liste + 40)
+        point = self.mapToGlobal(self.rect().bottomLeft())
+        self._popup.move(point)
+        self._popup.show()
+        self._search.setFocus()
+
+    def hidePopup(self):
+        self._popup.hide()
 
 
 def today_iso():
@@ -1630,9 +1804,9 @@ class CommandesProxy(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.filter_status = "Tous"
-        self.filter_fournisseur = ""
+        self.filter_fournisseur = []
         self.filter_facturation = "Tous"
-        self.filter_marche = "Tous"
+        self.filter_marche = []
         # Nouveaux filtres multiples
         self.filter_article_fonction = []
         self.filter_article_nature = []
@@ -1644,16 +1818,18 @@ class CommandesProxy(QSortFilterProxyModel):
         self.filter_status = status
         self.invalidateFilter()
 
-    def setFournisseurFilter(self, text):
-        self.filter_fournisseur = text or ""
+    def setFournisseurFilter(self, values):
+        """Filtre par fournisseur (liste de valeurs, vide = pas de filtre)."""
+        self.filter_fournisseur = values if values else []
         self.invalidateFilter()
 
     def setFacturationFilter(self, text):
         self.filter_facturation = text or ""
         self.invalidateFilter()
 
-    def setMarcheFilter(self, text):
-        self.filter_marche = text or "Tous"
+    def setMarcheFilter(self, values):
+        """Filtre par marché (liste de valeurs, vide = pas de filtre)."""
+        self.filter_marche = values if values else []
         self.invalidateFilter()
 
     def setNumCommandeFilter(self, text):
@@ -1718,18 +1894,18 @@ class CommandesProxy(QSortFilterProxyModel):
 
         if self.filter_fournisseur:
             fournisseur = row["fournisseur"] or ""
-            if self.filter_fournisseur.lower() not in fournisseur.lower():
+            if fournisseur not in self.filter_fournisseur:
                 return False
 
         if self.filter_facturation != "Tous":
             if row["statut_facturation"] != self.filter_facturation:
                 return False
 
-        if self.filter_marche != "Tous":
+        if self.filter_marche:
             marche = row["marche"] or ""
-            if self.filter_marche != marche:
+            if marche not in self.filter_marche:
                 return False
-        
+
         # Nouveaux filtres multiples
         if self.filter_article_fonction:
             article_fonction = row["article_fonction"] or ""
@@ -1844,9 +2020,9 @@ class FacturesProxy(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.filter_statut = "Tous"
-        self.filter_fournisseur = ""
+        self.filter_fournisseur = []
         self.filter_exercice = "Tous"
-        self.filter_marche = "Tous"
+        self.filter_marche = []
         # Filtres de recherche
         self.filter_num_commande = ""
         self.filter_num_facture = ""
@@ -1855,16 +2031,18 @@ class FacturesProxy(QSortFilterProxyModel):
         self.filter_statut = text or "Tous"
         self.invalidateFilter()
 
-    def setFournisseurFilter(self, text):
-        self.filter_fournisseur = text or ""
+    def setFournisseurFilter(self, values):
+        """Filtre par fournisseur (liste de valeurs, vide = pas de filtre)."""
+        self.filter_fournisseur = values if values else []
         self.invalidateFilter()
 
     def setExerciceFilter(self, text):
         self.filter_exercice = text or "Tous"
         self.invalidateFilter()
 
-    def setMarcheFilter(self, text):
-        self.filter_marche = text or "Tous"
+    def setMarcheFilter(self, values):
+        """Filtre par marché (liste de valeurs, vide = pas de filtre)."""
+        self.filter_marche = values if values else []
         self.invalidateFilter()
 
     def setNumCommandeFilter(self, text):
@@ -1919,16 +2097,16 @@ class FacturesProxy(QSortFilterProxyModel):
 
         if self.filter_fournisseur:
             fournisseur = row["fournisseur"] or ""
-            if self.filter_fournisseur.lower() not in fournisseur.lower():
+            if fournisseur not in self.filter_fournisseur:
                 return False
 
         if self.filter_exercice != "Tous":
             if (row["exercice"] or "") != self.filter_exercice:
                 return False
 
-        if self.filter_marche != "Tous":
+        if self.filter_marche:
             marche = row["marche"] or ""
-            if self.filter_marche != marche:
+            if marche not in self.filter_marche:
                 return False
 
         # Filtre par numéro de commande (via code_mouvement)
@@ -2030,19 +2208,29 @@ class FacturationProxy(QSortFilterProxyModel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.filter_statut = "Tous"
-        self.filter_fournisseur = ""
-        self.filter_marche = "Tous"
+        self.filter_fournisseur = []
+        self.filter_marche = []
+        self.filter_exercice = "Tous"
 
     def setStatutFilter(self, text):
         self.filter_statut = text or "Tous"
         self.invalidateFilter()
 
-    def setFournisseurFilter(self, text):
-        self.filter_fournisseur = text or ""
+    def setFournisseurFilter(self, values):
+        """Filtre par fournisseur (liste de valeurs, vide = pas de filtre)."""
+        self.filter_fournisseur = values if values else []
         self.invalidateFilter()
 
-    def setMarcheFilter(self, text):
-        self.filter_marche = text or "Tous"
+    def setMarcheFilter(self, values):
+        """Filtre par marché (liste de valeurs, vide = pas de filtre)."""
+        self.filter_marche = values if values else []
+        self.invalidateFilter()
+
+    def setExerciceFilter(self, text):
+        """Filtre par exercice. La colonne existe dans FACTURATION_COLUMNS
+        (issue de fetch_facturation_synthese) mais n'était jusqu'ici filtrable
+        nulle part."""
+        self.filter_exercice = text or "Tous"
         self.invalidateFilter()
 
     def lessThan(self, left, right):
@@ -2087,12 +2275,16 @@ class FacturationProxy(QSortFilterProxyModel):
 
         if self.filter_fournisseur:
             fournisseur = row["fournisseur"] or ""
-            if self.filter_fournisseur.lower() not in fournisseur.lower():
+            if fournisseur not in self.filter_fournisseur:
                 return False
 
-        if self.filter_marche != "Tous":
+        if self.filter_marche:
             marche = row["marche"] or ""
-            if self.filter_marche != marche:
+            if marche not in self.filter_marche:
+                return False
+
+        if self.filter_exercice != "Tous":
+            if (row["exercice"] or "") != self.filter_exercice:
                 return False
 
         return True
@@ -3143,10 +3335,30 @@ class MainWindow(QMainWindow):
         self.addToolBarBreak(Qt.TopToolBarArea)
 
         # ========== LIGNE 2 : FILTRES CLASSIQUES ==========
-        tb2 = QToolBar("Filtres")
-        tb2.setMovable(False)
-        # Style moderne avec fond gris clair, coins arrondis et bordure (compact)
-        tb2.setStyleSheet("""
+        # NOTE D'ARCHITECTURE — pourquoi plusieurs petites QToolBar plutôt
+        # qu'une seule grande :
+        #
+        # QToolBar.addWidget(widget) enveloppe le widget dans une QAction.
+        # Cacher/montrer ce widget nu (widget.setVisible(...)) s'est révélé
+        # peu fiable dans cette configuration : dès qu'un widget SIBLING de
+        # la même toolbar change de visibilité, Qt resynchronise chaque
+        # widget sur l'état de sa propre QAction, ce qui peut annuler un
+        # setVisible() précédent — et à l'inverse, un widget peut rester
+        # invisible juste après addWidget() même si son action est
+        # visible=True. C'est ce mécanisme qui laissait apparaître, par
+        # exemple, un filtre « Exercice » vide et non fonctionnel sur
+        # l'onglet Facturation : il n'était jamais censé y être visible,
+        # mais un widget voisin remis visible resynchronisait toute la
+        # toolbar sur l'état par défaut (visible) de chaque action.
+        #
+        # Cacher une TOOLBAR entière (QMainWindow.addToolBar) n'a pas ce
+        # problème : c'est un widget de fenêtre ordinaire, sans mécanisme de
+        # resynchronisation caché. Chaque groupe de filtres qui doit
+        # apparaître/disparaître selon l'onglet est donc sa propre toolbar ;
+        # seul le groupe entier est montré/caché, jamais un widget isolé au
+        # sein d'une toolbar partagée par d'autres widgets.
+
+        style_filtres = """
             QToolBar {
                 background-color: #f5f5f5;
                 border: 1px solid #d0d0d0;
@@ -3171,133 +3383,8 @@ class MainWindow(QMainWindow):
             QComboBox::drop-down {
                 border: none;
             }
-        """)
-        self.addToolBar(Qt.TopToolBarArea, tb2)
-        
-        # Label principal "Filtres:" en gras
-        label_filtres = QLabel("<b>Filtres:</b>", self)
-        tb2.addWidget(label_filtres)
-        
-        # Séparateur visuel
-        sep1 = QLabel("||", self)
-        sep1.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
-        tb2.addWidget(sep1)
-        
-        # Filtre 1 (Statut)
-        label_statut = QLabel("<b>Statut:</b>", self)
-        tb2.addWidget(label_statut)
-        self.filter1_combo = QComboBox(self)
-        self.filter1_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.filter1_combo.setMinimumContentsLength(10)
-        self.filter1_combo.currentTextChanged.connect(self.on_filter1_changed)
-        tb2.addWidget(self.filter1_combo)
-
-        # Séparateur visuel
-        sep2 = QLabel("||", self)
-        sep2.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
-        tb2.addWidget(sep2)
-
-        # Filtre 2 (Facturation/Exercice)
-        self.filter2_label = QLabel("<b>Facturation:</b>", self)
-        tb2.addWidget(self.filter2_label)
-        self.filter2_combo = QComboBox(self)
-        self.filter2_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.filter2_combo.setMinimumContentsLength(10)
-        self.filter2_combo.currentTextChanged.connect(self.on_filter2_changed)
-        tb2.addWidget(self.filter2_combo)
-
-        # Séparateur visuel
-        self.sep3 = QLabel("||", self)
-        self.sep3.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
-        tb2.addWidget(self.sep3)
-
-        # Filtre 3 (Fournisseur)
-        self.label_fournisseur = QLabel("<b>Fournisseur:</b>", self)
-        tb2.addWidget(self.label_fournisseur)
-        self.fournisseur_filter_combo = QComboBox(self)
-        self.fournisseur_filter_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.fournisseur_filter_combo.setMinimumContentsLength(12)
-        self.fournisseur_filter_combo.currentTextChanged.connect(self.on_fournisseur_filter_changed)
-        tb2.addWidget(self.fournisseur_filter_combo)
-
-        # Séparateur visuel
-        self.sep4 = QLabel("||", self)
-        self.sep4.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
-        tb2.addWidget(self.sep4)
-
-        # Filtre 4 (Marché)
-        self.marche_label = QLabel("<b>Marché:</b>", self)
-        tb2.addWidget(self.marche_label)
-        self.marche_filter_combo = QComboBox(self)
-        self.marche_filter_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.marche_filter_combo.setMinimumContentsLength(8)
-        self.marche_filter_combo.currentTextChanged.connect(self.on_marche_filter_changed)
-        tb2.addWidget(self.marche_filter_combo)
-
-        # ========== FILTRES MULTIPLES (sur la même ligne) ==========
-        
-        # Séparateur visuel
-        self.sep5 = QLabel("||", self)
-        self.sep5.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
-        tb2.addWidget(self.sep5)
-        
-        # Filtre Article fonction (choix multiples) avec icône ☑
-        self.article_fonction_label_base = "☑ Art. fonction"
-        self.article_fonction_label = QLabel(f"<b>{self.article_fonction_label_base}:</b>", self)
-        tb2.addWidget(self.article_fonction_label)
-        self.article_fonction_filter = CheckableComboBox(self)
-        self.article_fonction_filter.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.article_fonction_filter.setMinimumContentsLength(12)
-        self.article_fonction_filter.currentIndexChanged.connect(self.on_article_fonction_changed)
-        tb2.addWidget(self.article_fonction_filter)
-        
-        # Séparateur visuel
-        self.sep6 = QLabel("||", self)
-        self.sep6.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
-        tb2.addWidget(self.sep6)
-        
-        # Filtre Article nature (choix multiples) avec icône ☑
-        self.article_nature_label_base = "☑ Art. nature"
-        self.article_nature_label = QLabel(f"<b>{self.article_nature_label_base}:</b>", self)
-        tb2.addWidget(self.article_nature_label)
-        self.article_nature_filter = CheckableComboBox(self)
-        self.article_nature_filter.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.article_nature_filter.setMinimumContentsLength(12)
-        self.article_nature_filter.currentIndexChanged.connect(self.on_article_nature_changed)
-        tb2.addWidget(self.article_nature_filter)
-        
-        # Séparateur visuel
-        self.sep7 = QLabel("||", self)
-        self.sep7.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
-        tb2.addWidget(self.sep7)
-        
-        # Filtre Service émetteur (choix multiples) avec icône ☑
-        self.service_emetteur_label_base = "☑ Service"
-        self.service_emetteur_label = QLabel(f"<b>{self.service_emetteur_label_base}:</b>", self)
-        tb2.addWidget(self.service_emetteur_label)
-        self.service_emetteur_filter = CheckableComboBox(self)
-        self.service_emetteur_filter.setSizeAdjustPolicy(QComboBox.AdjustToContents)
-        self.service_emetteur_filter.setMinimumContentsLength(12)
-        self.service_emetteur_filter.currentIndexChanged.connect(self.on_service_emetteur_changed)
-        tb2.addWidget(self.service_emetteur_filter)
-        
-        # Séparateur visuel avant le bouton de réinitialisation
-        self.sep8 = QLabel("||", self)
-        self.sep8.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
-        tb2.addWidget(self.sep8)
-        
-        # Bouton pour réinitialiser les filtres multiples
-        act_clear_multi = QAction("Réinitialiser filtres", self)
-        act_clear_multi.triggered.connect(self.clear_multiple_filters)
-        tb2.addAction(act_clear_multi)
-
-        # Connecter le changement d'onglet pour adapter les filtres
-        self.tabs.currentChanged.connect(self.on_tab_changed)
-
-        # ========== LIGNE 3 : RECHERCHE PAR NUMÉRO ==========
-        tb3 = QToolBar("Recherche")
-        tb3.setMovable(False)
-        tb3.setStyleSheet("""
+        """
+        style_recherche = """
             QToolBar {
                 background-color: #e8f4f8;
                 border: 1px solid #b0d0e0;
@@ -3323,49 +3410,137 @@ class MainWindow(QMainWindow):
             QLineEdit:focus {
                 border: 2px solid #0078d4;
             }
-        """)
-        self.addToolBar(Qt.TopToolBarArea, tb3)
+        """
 
-        # Label principal "Recherche:" en gras
-        label_recherche = QLabel("<b>🔍 Recherche:</b>", self)
-        tb3.addWidget(label_recherche)
+        def _separateur():
+            sep = QLabel("||", self)
+            sep.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
+            return sep
 
-        # Séparateur visuel
-        sep_rech1 = QLabel("||", self)
-        sep_rech1.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
-        tb3.addWidget(sep_rech1)
+        def _nouvelle_toolbar(style):
+            tb = QToolBar("Filtres", self)
+            tb.setMovable(False)
+            tb.setStyleSheet(style)
+            self.addToolBar(Qt.TopToolBarArea, tb)
+            return tb
 
-        # Champ de recherche N° Commande (visible pour Commandes et Factures)
+        # ========== GROUPE FIXE : label, Statut, Fournisseur ==========
+        # Jamais masqué selon l'onglet : pas besoin d'une toolbar séparée par
+        # widget, seule la robustesse du groupe DANS SON ENSEMBLE compte, et
+        # ce groupe est toujours affiché en bloc (cf. plus bas, onglets sans
+        # rapport avec ces barres).
+        self.tb_base = _nouvelle_toolbar(style_filtres)
+        tb_base = self.tb_base
+        tb_base.addWidget(QLabel("<b>Filtres:</b>", self))
+        tb_base.addWidget(_separateur())
+        tb_base.addWidget(QLabel("<b>Statut:</b>", self))
+        self.filter1_combo = QComboBox(self)
+        self.filter1_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.filter1_combo.setMinimumContentsLength(10)
+        self.filter1_combo.currentTextChanged.connect(self.on_filter1_changed)
+        tb_base.addWidget(self.filter1_combo)
+        tb_base.addWidget(_separateur())
+        self.label_fournisseur = QLabel("<b>Fournisseur:</b>", self)
+        tb_base.addWidget(self.label_fournisseur)
+        self.fournisseur_filter_combo = SearchableCheckableComboBox(self)
+        self.fournisseur_filter_combo.setMinimumContentsLength(14)
+        self.fournisseur_filter_combo.selectionChanged.connect(self.on_fournisseur_filter_changed)
+        tb_base.addWidget(self.fournisseur_filter_combo)
+
+        # ========== GROUPE : Facturation / Exercice ==========
+        # Étiquette et contenu varient selon l'onglet (Commandes: "Facturation" ;
+        # Factures: "Exercice" ; Facturation: "Exercice", exercice du commencement
+        # dans le tableau ; Rappels: groupe entier masqué).
+        self.tb_filter2 = _nouvelle_toolbar(style_filtres)
+        self.tb_filter2.addWidget(_separateur())
+        self.filter2_label = QLabel("<b>Facturation:</b>", self)
+        self.tb_filter2.addWidget(self.filter2_label)
+        self.filter2_combo = QComboBox(self)
+        self.filter2_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.filter2_combo.setMinimumContentsLength(10)
+        self.filter2_combo.currentTextChanged.connect(self.on_filter2_changed)
+        self.tb_filter2.addWidget(self.filter2_combo)
+
+        # ========== GROUPE : Marché ==========
+        self.tb_marche = _nouvelle_toolbar(style_filtres)
+        self.tb_marche.addWidget(_separateur())
+        self.marche_label = QLabel("<b>Marché:</b>", self)
+        self.tb_marche.addWidget(self.marche_label)
+        self.marche_filter_combo = SearchableCheckableComboBox(self)
+        self.marche_filter_combo.setMinimumContentsLength(10)
+        self.marche_filter_combo.selectionChanged.connect(self.on_marche_filter_changed)
+        self.tb_marche.addWidget(self.marche_filter_combo)
+
+        # ========== GROUPE : filtres multiples (Commandes uniquement) ==========
+        self.tb_multi = _nouvelle_toolbar(style_filtres)
+        self.tb_multi.addWidget(_separateur())
+        self.article_fonction_label_base = "☑ Art. fonction"
+        self.article_fonction_label = QLabel(f"<b>{self.article_fonction_label_base}:</b>", self)
+        self.tb_multi.addWidget(self.article_fonction_label)
+        self.article_fonction_filter = CheckableComboBox(self)
+        self.article_fonction_filter.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.article_fonction_filter.setMinimumContentsLength(12)
+        self.article_fonction_filter.currentIndexChanged.connect(self.on_article_fonction_changed)
+        self.tb_multi.addWidget(self.article_fonction_filter)
+        self.tb_multi.addWidget(_separateur())
+        self.article_nature_label_base = "☑ Art. nature"
+        self.article_nature_label = QLabel(f"<b>{self.article_nature_label_base}:</b>", self)
+        self.tb_multi.addWidget(self.article_nature_label)
+        self.article_nature_filter = CheckableComboBox(self)
+        self.article_nature_filter.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.article_nature_filter.setMinimumContentsLength(12)
+        self.article_nature_filter.currentIndexChanged.connect(self.on_article_nature_changed)
+        self.tb_multi.addWidget(self.article_nature_filter)
+        self.tb_multi.addWidget(_separateur())
+        self.service_emetteur_label_base = "☑ Service"
+        self.service_emetteur_label = QLabel(f"<b>{self.service_emetteur_label_base}:</b>", self)
+        self.tb_multi.addWidget(self.service_emetteur_label)
+        self.service_emetteur_filter = CheckableComboBox(self)
+        self.service_emetteur_filter.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.service_emetteur_filter.setMinimumContentsLength(12)
+        self.service_emetteur_filter.currentIndexChanged.connect(self.on_service_emetteur_changed)
+        self.tb_multi.addWidget(self.service_emetteur_filter)
+        self.tb_multi.addWidget(_separateur())
+        act_clear_multi = QAction("Réinitialiser filtres", self)
+        act_clear_multi.triggered.connect(self.clear_multiple_filters)
+        self.tb_multi.addAction(act_clear_multi)
+
+        # Connecter le changement d'onglet pour adapter les filtres
+        self.tabs.currentChanged.connect(self.on_tab_changed)
+
+        # ========== LIGNE 3 : RECHERCHE PAR NUMÉRO ==========
+        # N° Commande est toujours affiché dès que la recherche l'est
+        # (Commandes, Factures) ; N° Facture ne s'y ajoute que pour Factures.
+        self.tb_search_cmd = _nouvelle_toolbar(style_recherche)
+        self.tb_search_cmd.addWidget(QLabel("<b>🔍 Recherche:</b>", self))
+        self.tb_search_cmd.addWidget(_separateur())
         self.label_search_cmd = QLabel("<b>N° Commande:</b>", self)
-        tb3.addWidget(self.label_search_cmd)
+        self.tb_search_cmd.addWidget(self.label_search_cmd)
         self.search_num_commande = QLineEdit(self)
         self.search_num_commande.setPlaceholderText("Rechercher un n° de commande...")
         self.search_num_commande.setClearButtonEnabled(True)
         self.search_num_commande.textChanged.connect(self.on_search_num_commande_changed)
-        tb3.addWidget(self.search_num_commande)
+        self.tb_search_cmd.addWidget(self.search_num_commande)
 
-        # Séparateur visuel
-        self.sep_rech2 = QLabel("||", self)
-        self.sep_rech2.setStyleSheet("font-weight: normal; color: #a0a0a0; padding: 0px 2px;")
-        tb3.addWidget(self.sep_rech2)
-
-        # Champ de recherche N° Facture (visible seulement pour Factures)
+        self.tb_search_fact = _nouvelle_toolbar(style_recherche)
+        self.tb_search_fact.addWidget(_separateur())
         self.label_search_fact = QLabel("<b>N° Facture:</b>", self)
-        tb3.addWidget(self.label_search_fact)
+        self.tb_search_fact.addWidget(self.label_search_fact)
         self.search_num_facture = QLineEdit(self)
         self.search_num_facture.setPlaceholderText("Rechercher un n° de facture...")
         self.search_num_facture.setClearButtonEnabled(True)
         self.search_num_facture.textChanged.connect(self.on_search_num_facture_changed)
-        tb3.addWidget(self.search_num_facture)
+        self.tb_search_fact.addWidget(self.search_num_facture)
 
-        # Espace flexible pour pousser les éléments à gauche
-        tb3.addWidget(QWidget())
+        self.search_toolbars = [self.tb_search_cmd, self.tb_search_fact]
 
-        # Sauvegarder la référence à la toolbar de recherche
-        self.search_toolbar = tb3
-
-        # Initialiser les filtres pour le premier onglet (APRÈS création des widgets)
-        self.on_tab_changed(0)
+        # L'initialisation des filtres du premier onglet est différée au premier
+        # showEvent() (cf. plus bas) : appeler on_tab_changed() ici, avant que la
+        # fenêtre ne soit jamais affichée, laisse certains widgets durablement
+        # invisibles même après le show() qui suit -- un widget rendu
+        # explicitement visible via setVisible(True) alors que sa fenêtre
+        # ancêtre n'a jamais été montrée ne se rattrape pas tout seul.
+        self._filtres_initialises = False
 
     def _init_tray(self):
         if not QSystemTrayIcon.isSystemTrayAvailable():
@@ -3415,135 +3590,94 @@ class MainWindow(QMainWindow):
     def on_tab_changed(self, index):
         """Adapter les filtres selon l'onglet actif."""
         tab_name = self.tabs.tabText(index)
-        
+
         # Réinitialiser les combos
         self.filter1_combo.blockSignals(True)
         self.filter2_combo.blockSignals(True)
         self.filter1_combo.clear()
         self.filter2_combo.clear()
-        
+
+        # Visibilité par GROUPE (toolbar entière, cf. note d'architecture dans
+        # _init_toolbar) : (filter2, marché, multi, recherche commande,
+        # recherche facture).
+        montrer_filter2 = montrer_marche = montrer_multi = False
+        montrer_recherche_cmd = montrer_recherche_fact = False
+
         if "Commandes" in tab_name:
             # Filtre 1: Statut commande
             self.filter1_combo.addItems(["Tous", "A suivre", "Envoyée"])
             # Filtre 2: Statut facturation
             self.filter2_label.setText("<b>Facturation:</b>")
-            self.filter2_label.setVisible(True)
-            self.filter2_combo.setVisible(True)
             self.filter2_combo.addItems(["Tous", "Non facturée", "Partiellement facturée", "Totalement facturée"])
-            # Filtre Marché: visible et avec liste déroulante
-            self.marche_label.setVisible(True)
-            self.marche_filter_combo.setVisible(True)
-            # Filtres multiples: visibles uniquement pour Commandes
-            self.sep5.setVisible(True)
-            self.article_fonction_label.setVisible(True)
-            self.article_fonction_filter.setVisible(True)
-            self.sep6.setVisible(True)
-            self.article_nature_label.setVisible(True)
-            self.article_nature_filter.setVisible(True)
-            self.sep7.setVisible(True)
-            self.service_emetteur_label.setVisible(True)
-            self.service_emetteur_filter.setVisible(True)
-            self.sep8.setVisible(True)
-            # Recherche: N° Commande visible, N° Facture caché
-            self.label_search_cmd.setVisible(True)
-            self.search_num_commande.setVisible(True)
-            self.sep_rech2.setVisible(False)
-            self.label_search_fact.setVisible(False)
-            self.search_num_facture.setVisible(False)
-            
+            montrer_filter2 = True
+            montrer_marche = True
+            montrer_multi = True
+            montrer_recherche_cmd = True
+
         elif "Factures" in tab_name and "Facturation" not in tab_name:
             # Filtre 1: Statut facture
             self.filter1_combo.addItems(["Tous", "Facturée", "Service fait", "En attente de paiement", "A vérifier"])
             # Filtre 2: Exercice
             self.filter2_label.setText("<b>Exercice:</b>")
-            self.filter2_label.setVisible(True)
-            self.filter2_combo.setVisible(True)
             exercices = self._get_exercices_factures()
             self.filter2_combo.addItem("Tous")
             self.filter2_combo.addItems(exercices)
-            # Filtre Marché: VISIBLE pour Factures
-            self.marche_label.setVisible(True)
-            self.marche_filter_combo.setVisible(True)
-            # Filtres multiples: cachés pour Factures
-            self.sep5.setVisible(False)
-            self.article_fonction_label.setVisible(False)
-            self.article_fonction_filter.setVisible(False)
-            self.sep6.setVisible(False)
-            self.article_nature_label.setVisible(False)
-            self.article_nature_filter.setVisible(False)
-            self.sep7.setVisible(False)
-            self.service_emetteur_label.setVisible(False)
-            self.service_emetteur_filter.setVisible(False)
-            self.sep8.setVisible(False)
-            # Recherche: N° Commande et N° Facture visibles
-            self.label_search_cmd.setVisible(True)
-            self.search_num_commande.setVisible(True)
-            self.sep_rech2.setVisible(True)
-            self.label_search_fact.setVisible(True)
-            self.search_num_facture.setVisible(True)
-            
+            montrer_filter2 = True
+            montrer_marche = True
+            montrer_recherche_cmd = True
+            montrer_recherche_fact = True
+
         elif "Facturation" in tab_name:
             # Filtre 1: Statut facturation
             self.filter1_combo.addItems(["Tous", "Non facturée", "Partiellement facturée", "Totalement facturée"])
-            # Filtre 2: caché (pas de second filtre pour Facturation)
-            self.filter2_label.setVisible(False)
-            self.filter2_combo.setVisible(False)
-            # Filtre Marché: visible et avec liste déroulante
-            self.marche_label.setVisible(True)
-            self.marche_filter_combo.setVisible(True)
-            # Filtres multiples: cachés pour Facturation
-            self.sep5.setVisible(False)
-            self.article_fonction_label.setVisible(False)
-            self.article_fonction_filter.setVisible(False)
-            self.sep6.setVisible(False)
-            self.article_nature_label.setVisible(False)
-            self.article_nature_filter.setVisible(False)
-            self.sep7.setVisible(False)
-            self.service_emetteur_label.setVisible(False)
-            self.service_emetteur_filter.setVisible(False)
-            self.sep8.setVisible(False)
-            # Recherche: tous cachés pour Facturation
-            self.label_search_cmd.setVisible(False)
-            self.search_num_commande.setVisible(False)
-            self.sep_rech2.setVisible(False)
-            self.label_search_fact.setVisible(False)
-            self.search_num_facture.setVisible(False)
+            # Filtre 2: Exercice -- la synthèse porte une colonne Exercice réelle
+            # (issue de fetch_facturation_synthese) ; elle n'a jamais été
+            # exploitée alors que la colonne existe déjà dans le tableau.
+            self.filter2_label.setText("<b>Exercice:</b>")
+            exercices = self._get_exercices_facturation()
+            self.filter2_combo.addItem("Tous")
+            self.filter2_combo.addItems(exercices)
+            montrer_filter2 = True
+            montrer_marche = True
 
         elif "Rappels" in tab_name:
             # Pas de filtres spécifiques pour rappels
-            self.filter2_label.setVisible(False)
-            self.filter2_combo.setVisible(False)
             self.filter1_combo.addItem("Tous")
-            # Filtre Marché: caché pour Rappels
-            self.marche_label.setVisible(False)
-            self.marche_filter_combo.setVisible(False)
-            # Filtres multiples: cachés pour Rappels
-            self.sep5.setVisible(False)
-            self.article_fonction_label.setVisible(False)
-            self.article_fonction_filter.setVisible(False)
-            self.sep6.setVisible(False)
-            self.article_nature_label.setVisible(False)
-            self.article_nature_filter.setVisible(False)
-            self.sep7.setVisible(False)
-            self.service_emetteur_label.setVisible(False)
-            self.service_emetteur_filter.setVisible(False)
-            self.sep8.setVisible(False)
-            # Recherche: tous cachés pour Rappels
-            self.label_search_cmd.setVisible(False)
-            self.search_num_commande.setVisible(False)
-            self.sep_rech2.setVisible(False)
-            self.label_search_fact.setVisible(False)
-            self.search_num_facture.setVisible(False)
+
+        # Onglets sans rapport avec ces barres (Suivi marchés, Opérations,
+        # Historique ont leurs propres filtres) : tout masquer plutôt que de
+        # laisser les valeurs du dernier onglet visité affichées, figées et
+        # sans effet.
+        barres_partagees_utiles = any(
+            nom in tab_name for nom in ("Commandes", "Rappels", "Factures", "Facturation")
+        )
+        if not barres_partagees_utiles:
+            montrer_filter2 = montrer_marche = montrer_multi = False
+            montrer_recherche_cmd = montrer_recherche_fact = False
+
+        # Un seul setVisible() par toolbar, avec sa valeur finale : un widget
+        # QComboBox (marche_filter_combo, fournisseur_filter_combo) peut rester
+        # visuellement bloqué invisible si sa toolbar ancêtre reçoit deux
+        # setVisible(True) consécutifs (le second, redondant, ne redéclenche
+        # pas toujours la resynchronisation Qt) -- cf. tb_marche ci-dessous,
+        # qui recevait auparavant un setVisible(True) générique PUIS un second
+        # setVisible(True) spécifique.
+        self.tb_base.setVisible(barres_partagees_utiles)
+        self.tb_filter2.setVisible(montrer_filter2)
+        self.tb_marche.setVisible(montrer_marche)
+        self.tb_multi.setVisible(montrer_multi)
+        self.tb_search_cmd.setVisible(montrer_recherche_cmd)
+        self.tb_search_fact.setVisible(montrer_recherche_fact)
 
         self.filter1_combo.blockSignals(False)
         self.filter2_combo.blockSignals(False)
-        
+
         # Rafraîchir la liste des fournisseurs
         self.refresh_fournisseur_filter()
-        
-        # Rafraîchir la liste des marchés (pour Commandes et Facturation)
+
+        # Rafraîchir la liste des marchés (pour Commandes, Factures et Facturation)
         self.refresh_marche_filter()
-        
+
         # Rafraîchir les filtres multiples (uniquement pour Commandes)
         self.refresh_multiple_filters()
 
@@ -3552,6 +3686,15 @@ class MainWindow(QMainWindow):
         cur = self.db.conn.cursor()
         cur.execute("SELECT DISTINCT exercice FROM factures WHERE exercice IS NOT NULL AND exercice != '' ORDER BY exercice DESC")
         return [r[0] for r in cur.fetchall()]
+
+    def _get_exercices_facturation(self):
+        """Exercices distincts de la synthèse Facturation (commandes + factures
+        orphelines), tirés du modèle déjà chargé pour rester cohérents avec ce
+        qui est effectivement affiché dans le tableau."""
+        exercices = {
+            row["exercice"] for row in self.synth_model.rows if row["exercice"]
+        }
+        return sorted(exercices, reverse=True)
 
     def _get_marches(self):
         """Récupère la liste des marchés selon l'onglet actif."""
@@ -3596,38 +3739,41 @@ class MainWindow(QMainWindow):
         """Filtre 2 change selon l'onglet."""
         tab_index = self.tabs.currentIndex()
         tab_name = self.tabs.tabText(tab_index)
-        
+
         if "Commandes" in tab_name:
             self.cmd_proxy.setFacturationFilter(text)
         elif "Factures" in tab_name and "Facturation" not in tab_name:
             self.fact_proxy.setExerciceFilter(text)
+        elif "Facturation" in tab_name:
+            self.synth_proxy.setExerciceFilter(text)
 
-    def on_fournisseur_filter_changed(self, text):
-        """Filtre fournisseur - fonctionne sur tous les onglets avec modèles."""
-        # Si "Tous" est sélectionné, on passe une chaîne vide pour ne pas filtrer
-        filter_text = "" if text == "Tous" else text
-        
+    def on_fournisseur_filter_changed(self):
+        """Filtre fournisseur (choix multiples) - tous les onglets avec modèles."""
+        checked = self.fournisseur_filter_combo.checked_items()
+
         tab_index = self.tabs.currentIndex()
         tab_name = self.tabs.tabText(tab_index)
-        
-        if "Commandes" in tab_name:
-            self.cmd_proxy.setFournisseurFilter(filter_text)
-        elif "Factures" in tab_name and "Facturation" not in tab_name:
-            self.fact_proxy.setFournisseurFilter(filter_text)
-        elif "Facturation" in tab_name:
-            self.synth_proxy.setFournisseurFilter(filter_text)
 
-    def on_marche_filter_changed(self, text):
-        """Filtre marché - fonctionne sur Commandes, Factures et Facturation."""
+        if "Commandes" in tab_name:
+            self.cmd_proxy.setFournisseurFilter(checked)
+        elif "Factures" in tab_name and "Facturation" not in tab_name:
+            self.fact_proxy.setFournisseurFilter(checked)
+        elif "Facturation" in tab_name:
+            self.synth_proxy.setFournisseurFilter(checked)
+
+    def on_marche_filter_changed(self):
+        """Filtre marché (choix multiples) - Commandes, Factures et Facturation."""
+        checked = self.marche_filter_combo.checked_items()
+
         tab_index = self.tabs.currentIndex()
         tab_name = self.tabs.tabText(tab_index)
-        
+
         if "Commandes" in tab_name:
-            self.cmd_proxy.setMarcheFilter(text)
+            self.cmd_proxy.setMarcheFilter(checked)
         elif "Factures" in tab_name and "Facturation" not in tab_name:
-            self.fact_proxy.setMarcheFilter(text)
+            self.fact_proxy.setMarcheFilter(checked)
         elif "Facturation" in tab_name:
-            self.synth_proxy.setMarcheFilter(text)
+            self.synth_proxy.setMarcheFilter(checked)
     
     def on_article_fonction_changed(self, index):
         """Filtre article fonction (choix multiples) - Commandes uniquement."""
@@ -4444,9 +4590,7 @@ class MainWindow(QMainWindow):
         fournisseurs = sorted(list(fournisseurs_set))
         self.fournisseur_filter_combo.blockSignals(True)
         self.fournisseur_filter_combo.clear()
-        self.fournisseur_filter_combo.addItem("Tous")
-        for f in fournisseurs:
-            self.fournisseur_filter_combo.addItem(f)
+        self.fournisseur_filter_combo.addItems(fournisseurs)
         self.fournisseur_filter_combo.blockSignals(False)
 
     def refresh_marche_filter(self):
@@ -4461,9 +4605,7 @@ class MainWindow(QMainWindow):
         marches = self._get_marches()
         self.marche_filter_combo.blockSignals(True)
         self.marche_filter_combo.clear()
-        self.marche_filter_combo.addItem("Tous")
-        for m in marches:
-            self.marche_filter_combo.addItem(m)
+        self.marche_filter_combo.addItems(marches)
         self.marche_filter_combo.blockSignals(False)
     
     def refresh_multiple_filters(self):
@@ -4737,22 +4879,25 @@ class MainWindow(QMainWindow):
         if filter1_text and filter1_text != "Tous":
             filters.append(f"Statut: {filter1_text}")
         
-        # Filtre 2
-        if self.filter2_combo.isVisible():
+        # Filtre 2 -- interroger la toolbar plutôt que le widget : c'est elle
+        # qui porte la visibilité pertinente pour l'onglet courant (cf.
+        # on_tab_changed), le widget nu ne devant plus jamais être piloté
+        # individuellement.
+        if self.tb_filter2.isVisible():
             filter2_text = self.filter2_combo.currentText()
             if filter2_text and filter2_text != "Tous":
                 filters.append(f"Exercice/Facturation: {filter2_text}")
-        
-        # Filtre fournisseur
-        fournisseur_text = self.fournisseur_filter_combo.currentText()
-        if fournisseur_text and fournisseur_text != "Tous":
-            filters.append(f"Fournisseur: {fournisseur_text}")
-        
-        # Filtre marché
-        if self.marche_filter_combo.isVisible():
-            marche_text = self.marche_filter_combo.currentText()
-            if marche_text and marche_text != "Tous":
-                filters.append(f"Marché: {marche_text}")
+
+        # Filtre fournisseur (choix multiples)
+        checked_fournisseurs = self.fournisseur_filter_combo.checked_items()
+        if checked_fournisseurs:
+            filters.append(f"Fournisseur: {', '.join(checked_fournisseurs)}")
+
+        # Filtre marché (choix multiples)
+        if self.tb_marche.isVisible():
+            checked_marches = self.marche_filter_combo.checked_items()
+            if checked_marches:
+                filters.append(f"Marché: {', '.join(checked_marches)}")
         
         # Filtres multiples (Commandes uniquement)
         if "Commandes" in tab_name:
@@ -6224,6 +6369,15 @@ class MainWindow(QMainWindow):
                 self.refresh_rappels_tab()
             except Exception:
                 pass
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # Première apparition réelle de la fenêtre : c'est seulement à partir
+        # d'ici que les setVisible() sur les widgets de la toolbar de filtres
+        # produisent un état fiable (cf. commentaire dans _init_toolbar()).
+        if not self._filtres_initialises:
+            self._filtres_initialises = True
+            self.on_tab_changed(self.tabs.currentIndex())
 
     def closeEvent(self, event):
         if self.error_log:

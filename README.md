@@ -1,6 +1,28 @@
 # suivi_march-
 Logiciel de gestion pour suivi des marchés
 
+## Démarrer l'application
+
+Sous Windows, double-cliquer **`Lancer_suivi_marches.cmd`**. Il repère Python,
+installe les dépendances manquantes, puis démarre l'application en journalisant
+dans `run_logs\`. En cas d'échec, le journal s'ouvre automatiquement.
+
+```
+Lancer_suivi_marches.cmd            lance l'application
+Lancer_suivi_marches.cmd --maj      réinstalle les dépendances puis lance
+Lancer_suivi_marches.cmd --verif    vérifie seulement, ne lance rien
+```
+
+L'installation se déclenche si un module manque **ou** si `requirements.txt` a
+changé depuis la dernière installation réussie — une version relevée ou une
+dépendance ajoutée qui se trouve déjà présente passerait sinon inaperçue. Une
+empreinte du fichier est notée dans `run_logs/requirements_installees.txt`.
+
+La logique est dans `lanceur.py` (utilisable seul : `python lanceur.py --verif`) ;
+le `.cmd` ne fait que trouver Python. Si `pip` refuse les versions figées de
+`requirements.txt` — `pandas==2.1.4` n'a pas de binaire au-delà de Python 3.12 —
+le lanceur réessaie en les traitant comme des minima et le signale.
+
 ## Suivi financier par opération
 
 L'export « suivi financier » émet **une ligne par état de bon de commande**,
@@ -102,14 +124,43 @@ Deux boutons couvrent le même besoin sans passer par la ligne de commande :
 - **🔁 Tout régénérer** (onglet *Opérations*) régénère toutes les opérations dans
   un dossier au choix, avec barre de progression et annulation.
 
+### Filtres (Commandes, Rappels, Factures, Facturation)
+
+Les filtres **Marché** et **Fournisseur** sont à sélection multiple avec
+recherche (`SearchableCheckableComboBox`) : cliquer ouvre une liste à cases à
+cocher avec un champ de recherche en tête, nécessaire dès que la centaine de
+marchés ou de fournisseurs du dépôt rend une liste plate illisible. L'option
+« [Tous] » coche/décoche l'intégralité de la liste, y compris ce qu'une
+recherche en cours masque à l'écran.
+
+L'onglet **Facturation** a un filtre **Exercice** fonctionnel : la colonne
+existe dans le tableau (`FACTURATION_COLUMNS`) mais n'était filtrable nulle
+part.
+
+Chaque groupe de filtres qui doit apparaître/disparaître selon l'onglet actif
+(Facturation/Exercice, Marché, les filtres multiples de Commandes, les deux
+champs de recherche) est sa **propre `QToolBar`**, montrée/cachée dans son
+ensemble plutôt qu'un widget isolé au sein d'une toolbar partagée. Cacher un
+widget nu ajouté via `QToolBar.addWidget()` s'est révélé peu fiable : Qt
+resynchronise chaque widget sur l'état de sa propre `QAction` dès qu'un widget
+*sibling* de la même toolbar change de visibilité, ce qui pouvait laisser
+apparaître un filtre masqué par erreur — c'est ce qui produisait un filtre
+« Exercice » vide et non fonctionnel sur l'onglet Facturation. Cacher une
+toolbar entière n'a pas ce problème. Pour la même raison, l'initialisation des
+filtres du premier onglet est différée au premier `showEvent()` plutôt
+qu'appelée pendant la construction de la fenêtre.
+
 ### Tests
 
 L'interface est testée sans affichage (`QT_QPA_PLATFORM=offscreen`) ;
-`test_interface.py` est ignoré si PyQt5 n'est pas installé.
+`test_interface.py` et `test_filtres_ui.py` sont ignorés si PyQt5 n'est pas
+installé.
 
 
 ```bash
 python -m unittest test_suivi_financier.py -v
 python -m unittest test_matching.py -v
 python -m unittest test_interface.py -v
+python -m unittest test_lanceur.py -v
+python -m unittest test_filtres_ui.py -v
 ```

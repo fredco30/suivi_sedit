@@ -6,3 +6,5 @@ __pycache__/
 .DS_Store
 .claude/settings.local.json
 regeneration_cache.db
+run_logs/AE_RUN_*.log
+run_logs/requirements_*.txt
