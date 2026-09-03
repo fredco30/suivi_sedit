@@ -5911,9 +5911,11 @@ class MainWindow(QMainWindow):
                     "Export réussi",
                     f"✅ Suivi financier opération {code_operation} exporté !\n\n"
                     f"Fichier : {filepath}\n\n"
-                    f"Le fichier contient 2 feuilles :\n"
-                    f"• FINANCIER : Détail facture par facture\n"
-                    f"• A jour : Vue synthétique par tranche"
+                    f"Le fichier contient 4 feuilles :\n"
+                    f"• FINANCIER : Une ligne par état de BDC (factures mandatées + reliquat engagé)\n"
+                    f"• A jour : Vue synthétique, une ligne par BDC\n"
+                    f"• Anomalies : Montants de BDC à arbitrer\n"
+                    f"• Lignes neutralisées : Trace des engagements soldés ou ramenés au reliquat"
                 )
             else:
                 QMessageBox.critical(
@@ -5980,9 +5982,11 @@ class MainWindow(QMainWindow):
                     "Export réussi",
                     f"✅ Suivi financier opération {code_operation} exporté !\n\n"
                     f"Fichier : {filepath}\n\n"
-                    f"Le fichier contient 2 feuilles :\n"
-                    f"• FINANCIER : Détail facture par facture\n"
-                    f"• A jour : Vue synthétique par tranche"
+                    f"Le fichier contient 4 feuilles :\n"
+                    f"• FINANCIER : Une ligne par état de BDC (factures mandatées + reliquat engagé)\n"
+                    f"• A jour : Vue synthétique, une ligne par BDC\n"
+                    f"• Anomalies : Montants de BDC à arbitrer\n"
+                    f"• Lignes neutralisées : Trace des engagements soldés ou ramenés au reliquat"
                 )
             else:
                 QMessageBox.critical(
