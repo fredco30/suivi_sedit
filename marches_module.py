@@ -31,6 +31,7 @@ class MarchesAnalyzer:
     - AH (33): Montant service fait
     - AI (34): Date service fait
     - AM (38): Commande
+    - E (4): Code mouvement (n° d'engagement, repli du n° de commande)
     - AN (39): Marché
     - AO (40): Tranche
     - AT (45): Mandat
@@ -48,6 +49,7 @@ class MarchesAnalyzer:
     COL_FOURNISSEUR = 8        # I - Nom tiers
     COL_LIBELLE = 13           # N - Libellé
     COL_FACTURE = 36           # AL - Facture
+    COL_CODE_MOUVEMENT = 4     # E - Code mouvement (n° d'engagement)
 
     # Provenance de l'enveloppe initiale affichée dans l'en-tête de l'export
     ENVELOPPE_BASE = "base"
@@ -102,6 +104,21 @@ class MarchesAnalyzer:
         exercices_list = sorted(exercices)
         return ["Tous"] + exercices_list
 
+    def _resoudre_num_bdc(self, df: pd.DataFrame) -> pd.Series:
+        """N° de bon de commande de chaque ligne SEDIT.
+
+        La colonne « Commande » (AM) n'est renseignée que lorsque la ligne a été
+        rattachée à un bon de commande — elle est vide sur près de 40 % des
+        lignes, qui se retrouvaient alors sans BDC et hors de toute agrégation.
+        La colonne « Code mouvement » (E) porte le n° d'engagement sur toutes
+        les lignes et concorde avec « Commande » partout où les deux sont
+        renseignées : elle sert donc de repli.
+        """
+        commande = df.iloc[:, self.COL_COMMANDE]
+        mouvement = df.iloc[:, self.COL_CODE_MOUVEMENT]
+        vide = commande.isna() | (commande.astype(str).str.strip() == '')
+        return commande.mask(vide, mouvement)
+
     def load_data(self, force_reload: bool = False):
         """
         Charge les données depuis le fichier Excel avec synchronisation SQLite.
@@ -147,7 +164,7 @@ class MarchesAnalyzer:
                             'montant_ttc': df_to_sync.iloc[:, self.COL_MONTANT_TTC],
                             'num_mandat': df_to_sync.iloc[:, self.COL_MANDAT],
                             'tranche': df_to_sync.iloc[:, self.COL_TRANCHE],
-                            'commande': df_to_sync.iloc[:, self.COL_COMMANDE],
+                            'commande': self._resoudre_num_bdc(df_to_sync),
                         })
 
                         # Synchroniser vers SQLite
@@ -203,6 +220,8 @@ class MarchesAnalyzer:
                     self.df.iloc[:, self.COL_MARCHE].notna() &
                     (self.df.iloc[:, self.COL_MARCHE] != '')
                 ].copy()
+                self.df_marches.iloc[:, self.COL_COMMANDE] = \
+                    self._resoudre_num_bdc(self.df_marches)
 
             return True
 

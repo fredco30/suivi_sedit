@@ -22,6 +22,19 @@ issue du même jeu de données), `Anomalies` (montants de BDC à arbitrer) et
 La règle d'agrégation est isolée dans `suivi_financier_agg.py`, indépendamment
 de la génération Excel.
 
+### Colonnes SEDIT utilisées
+
+| Colonne | Rôle |
+|---|---|
+| E — `Code mouvement` | N° d'engagement. Renseigné sur **toutes** les lignes ; sert de repli quand `Commande` est vide (près de 40 % des lignes). |
+| O — `Montant initial` | Montant **total** du BDC, répété sur chacune de ses lignes. Source du `montant_ref`. |
+| AD — `Montant TTC` | Montant de la ligne : facture mandatée, ou part encore engagée. |
+| AL / AT — `Facture` / `Mandat` | Une ligne est une réalisation si les deux sont renseignés. |
+| AM — `Commande` | N° de BDC, renseigné seulement quand la ligne a été rattachée à une commande. |
+
+Les exports SEDIT sont annuels et se recouvrent : le suivi d'une opération
+pluriannuelle se lit sur leur **réunion**, pas sur un seul fichier.
+
 ### Régénérer les suivis déjà diffusés
 
 Les fichiers produits avant ce correctif comptent deux fois l'enveloppe

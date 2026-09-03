@@ -21,6 +21,7 @@ ou
 """
 from __future__ import annotations
 
+import glob
 import os
 import tempfile
 import unittest
@@ -42,6 +43,8 @@ from suivi_financier_agg import (
 )
 
 MARCHE = "2020_14G3P"
+# Index de colonnes SEDIT touches par les tests de resolution du n° de BDC.
+MARCHE_COLONNES = (4, 38)
 FOURNISSEUR = "BOUYGUES ENERGIES ET SERVICES"
 
 
@@ -287,20 +290,45 @@ class TestProprieteGenerique(unittest.TestCase):
 # Export Excel complet
 # ---------------------------------------------------------------------------
 
+_ANALYZER_CACHE: List = []
+
+
 def _charger_analyzer():
-    """Construit un analyzer sur les donnees du depot, ou None si indisponible."""
-    if not os.path.exists("suivi_commandes.db") or not os.path.exists("marches_cache.db"):
+    """Analyzer sur le jeu de reference, ou None si les sources sont absentes.
+
+    Les exports SEDIT sont annuels et se recouvrent ; le suivi d'une operation
+    pluriannuelle se lit sur leur reunion. On la reconstitue ici dans un cache
+    temporaire, sans toucher au cache de travail de l'application.
+    """
+    if _ANALYZER_CACHE:
+        return _ANALYZER_CACHE[0]
+
+    sources = sorted(glob.glob(os.path.join("data_sources", "factures*.xls")))
+    if not sources or not os.path.exists("suivi_commandes.db"):
         return None
     try:
+        import pandas as pd
         from marches_module import MarchesAnalyzer
+        from marches_sync import MarchesSync
         from regenerer_suivis import BaseSuiviLectureSeule
     except ImportError:
         return None
 
+    repertoire = tempfile.mkdtemp()
+    consolide = os.path.join(repertoire, "factures_consolidees.xlsx")
+    pd.concat([pd.read_excel(source) for source in sources], ignore_index=True) \
+        .drop_duplicates() \
+        .to_excel(consolide, index=False)
+
     analyzer = MarchesAnalyzer(
-        "database_sync", database=BaseSuiviLectureSeule("suivi_commandes.db"), use_cache=True
+        consolide, database=BaseSuiviLectureSeule("suivi_commandes.db"), use_cache=True
     )
-    return analyzer if analyzer.load_data() else None
+    analyzer.sync = MarchesSync(os.path.join(repertoire, "cache_test.db"))
+    if not analyzer.load_data(force_reload=True):
+        return None
+
+    _ANALYZER_CACHE.append(analyzer)
+    return analyzer
 
 
 def _lignes_financier(ws) -> List[dict]:
@@ -429,26 +457,111 @@ class TestExportOperation(unittest.TestCase):
             self.assertNotIn("REPORT)", designation)
 
 
+class TestResolutionNumeroBdc(unittest.TestCase):
+    """La colonne « Commande » est vide sur pres de 40 % des lignes SEDIT.
+
+    Le n° d'engagement se lit alors dans « Code mouvement ». Sans ce repli, ces
+    lignes se retrouvent sans BDC et echappent a toute agregation par BDC.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import pandas as pd
+            from marches_module import MarchesAnalyzer
+        except ImportError:
+            raise unittest.SkipTest("pandas indisponible")
+        cls.pd = pd
+        cls.analyzer = MarchesAnalyzer("inexistant.xls", use_cache=False)
+
+    def _df(self, lignes):
+        largeur = max(MARCHE_COLONNES) + 1
+        return self.pd.DataFrame(lignes, columns=range(largeur))
+
+    def test_repli_sur_le_code_mouvement(self):
+        colonnes = [None] * (max(MARCHE_COLONNES) + 1)
+        ligne_liee = list(colonnes)
+        ligne_liee[4], ligne_liee[38] = "24AA02259", "24AA02259"
+        ligne_orpheline = list(colonnes)
+        ligne_orpheline[4], ligne_orpheline[38] = "25AA03133", None
+        ligne_vide = list(colonnes)
+        ligne_vide[4], ligne_vide[38] = "26AA00890", "   "
+
+        resolus = self.analyzer._resoudre_num_bdc(
+            self._df([ligne_liee, ligne_orpheline, ligne_vide])
+        )
+        self.assertEqual(
+            list(resolus), ["24AA02259", "25AA03133", "26AA00890"]
+        )
+
+    def test_toutes_les_ecritures_du_jeu_de_reference_portent_un_bdc(self):
+        analyzer = _charger_analyzer()
+        if analyzer is None:
+            self.skipTest("données du dépôt indisponibles")
+        groupes, _, _, _, info = analyzer.collecter_ecritures_operation(MARCHE)
+        if info is None:
+            self.skipTest(f"opération {MARCHE} absente")
+        sans_bdc = [
+            e for ecritures in groupes.values() for e in ecritures if not e.num_commande
+        ]
+        self.assertEqual(sans_bdc, [])
+
+
 class TestValeursReference2020_14G3P(unittest.TestCase):
     """Valeurs chiffrees attendues sur le jeu de reference `2020_14G3P`.
 
-    Ces montants proviennent du fichier diffuse analyse dans le correctif. Ils
-    ne sont verifiables que sur ce jeu de donnees precis : l'instantane
-    versionne dans le depot est plus ancien et donne d'autres totaux. Les tests
-    sont donc ignores tant que le jeu charge ne correspond pas.
+    Le jeu est la reunion des exports SEDIT annuels de `data_sources/`, soit
+    172 ecritures pour ce marche -- le meme perimetre que le fichier diffuse.
+
+    Ecart assume avec le fichier corrige fourni comme modele
+    ------------------------------------------------------
+    Ce fichier a ete construit par retraitement du tableau defectueux, sans la
+    colonne « Montant initial » (O) de l'export SEDIT. Faute de cette source, il
+    retient le plus gros montant *de ligne* de chaque BDC et signale sept BDC
+    « Montant BDC à confirmer ». La colonne O porte le montant total du BDC :
+    elle en tranche quatre, tous sous-evalues par le fichier modele.
+
+      BDC          modele       colonne O   ecart      lecture
+      21AA01640    2 316,00     3 777,60    1 461,60   BDC en 2 lignes (n° 3 et 4), aucune facturee
+      22AA02376    8 421,96    14 619,96    6 198,00   ligne 2 facturee, ligne 1 jamais facturee
+      25AA00614   57 899,13    60 000,00    2 100,87   BDC annuel, 13e mensualite non facturee
+      25AA02351   32 839,20    46 048,20   13 209,00   ligne 1 facturee, ligne 2 non facturee
+                                           ---------
+                                           22 969,47
+
+    La colonne « Reste engagé » (F) de SEDIT confirme la lecture par la colonne
+    O : sur les 19 BDC ou elle est renseignee, le reliquat calcule ici la
+    reproduit exactement (les trois apparents ecarts sont des lignes soldees
+    dans un export plus recent que celui qui portait le reste engage).
+
+    Totaux du fichier modele, pour memoire : 134 lignes, 1 803 139,47 € imputes,
+    261 094,21 € engages, solde 2 372 586,53 €.
     """
 
-    ATTENDU = {
+    # Valeurs du fichier modele, conservees pour tracer l'ecart de 22 969,47 €.
+    MODELE = {
         "nb_lignes": 134,
-        "nb_lignes_facturees": 113,
         "nb_lignes_engagement": 21,
         "total_impute": 1803139.47,
-        "total_facture": 1542045.26,
         "total_engagement": 261094.21,
-        "total_bdc_distincts": 1706415.26,
         "solde_final": 2372586.53,
+    }
+
+    ATTENDU = {
+        "nb_lignes": 137,
+        "nb_lignes_facturees": 113,
+        "nb_lignes_engagement": 24,
+        "total_impute": 1826108.94,
+        "total_facture": 1542045.26,
+        "total_engagement": 284063.68,
+        "total_bdc_distincts": 1826108.94,
+        "solde_final": 2349617.06,
         "enveloppe_initiale": 4175726.00,
     }
+
+    # Empreinte du jeu de reference : deux valeurs sur lesquelles le calcul et
+    # le fichier modele s'accordent, donc neutres vis-a-vis de l'ecart assume.
+    EMPREINTE = {"nb_bdc": 100, "total_facture": 1542045.26}
 
     @classmethod
     def setUpClass(cls):
@@ -467,11 +580,12 @@ class TestValeursReference2020_14G3P(unittest.TestCase):
             )
         cls.enveloppe = sum(enveloppes.values())
 
-        if abs(cls.resultat.total_impute - cls.ATTENDU["total_impute"]) > 0.01:
+        empreinte = (len(cls.resultat.bdcs), round(cls.resultat.total_facture, 2))
+        attendue = (cls.EMPREINTE["nb_bdc"], cls.EMPREINTE["total_facture"])
+        if empreinte != attendue:
             raise unittest.SkipTest(
-                "jeu de données différent de la référence du correctif "
-                f"({cls.resultat.total_impute:.2f} € imputés au lieu de "
-                f"{cls.ATTENDU['total_impute']:.2f} €) — "
+                f"jeu de données différent de la référence (empreinte {empreinte} "
+                f"au lieu de {attendue}) — "
                 "rejouer ces assertions sur l'export SEDIT de référence"
             )
 
@@ -491,6 +605,22 @@ class TestValeursReference2020_14G3P(unittest.TestCase):
         self.assertAlmostEqual(
             self.resultat.total_impute, self.ATTENDU["total_impute"], places=2
         )
+
+    def test_ecart_assume_avec_le_fichier_modele(self):
+        """L'écart avec le fichier modèle vaut exactement les 4 BDC sous-évalués."""
+        ecart = self.resultat.total_impute - self.MODELE["total_impute"]
+        self.assertAlmostEqual(ecart, 22969.47, places=2)
+
+        # Les quatre BDC concernés, montant de référence lu en colonne O.
+        attendus = {
+            "21AA01640": 3777.60,
+            "22AA02376": 14619.96,
+            "25AA00614": 60000.00,
+            "25AA02351": 46048.20,
+        }
+        par_bdc = {b.cle_bdc: round(b.montant_ref, 2) for b in self.resultat.bdcs}
+        for bdc, montant in attendus.items():
+            self.assertAlmostEqual(par_bdc[bdc], montant, places=2, msg=f"BDC {bdc}")
 
     def test_3_somme_lignes_facturees(self):
         self.assertAlmostEqual(
