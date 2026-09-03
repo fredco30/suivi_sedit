@@ -2532,6 +2532,27 @@ class MainWindow(QMainWindow):
             }
         """)
         header_global_layout.addWidget(btn_export_marches)
+
+        btn_enveloppes = QPushButton("💶 Enveloppes des marchés")
+        btn_enveloppes.setToolTip(
+            "Saisir en une passe le montant notifié de chaque marché.\n"
+            "Sans lui, le solde des suivis se calcule contre un total reconstitué."
+        )
+        btn_enveloppes.clicked.connect(self.saisir_enveloppes_marches)
+        btn_enveloppes.setStyleSheet("""
+            QPushButton {
+                background-color: #fd7e14;
+                color: white;
+                border: none;
+                padding: 5px 15px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #e8690b;
+            }
+        """)
+        header_global_layout.addWidget(btn_enveloppes)
         header_global_layout.addStretch()
 
         marches_layout.addWidget(header_global)
@@ -2708,6 +2729,31 @@ class MainWindow(QMainWindow):
         """)
         btn_export_operation_2020.clicked.connect(self.export_suivi_financier_2020_14G3P)
         filtre_operation_layout.addWidget(btn_export_operation_2020)
+
+        # Régénération en lot de toutes les opérations
+        btn_regenerer_tout = QPushButton("🔁 Tout régénérer")
+        btn_regenerer_tout.setMaximumWidth(180)
+        btn_regenerer_tout.setToolTip(
+            "Régénérer le suivi financier de toutes les opérations dans un dossier."
+        )
+        btn_regenerer_tout.clicked.connect(self.regenerer_tous_les_suivis)
+        btn_regenerer_tout.setStyleSheet("""
+            QPushButton {
+                background-color: #17a2b8;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #138496;
+            }
+            QPushButton:pressed {
+                background-color: #0f6674;
+            }
+        """)
+        filtre_operation_layout.addWidget(btn_regenerer_tout)
 
         filtre_operation_layout.addStretch()
 
@@ -5848,6 +5894,100 @@ class MainWindow(QMainWindow):
                 self.edit_filtre_historique.setText(marches[0])
             else:
                 self.edit_filtre_historique.setText(code_operation)
+
+    def saisir_enveloppes_marches(self):
+        """Ouvre la saisie en masse des enveloppes contractuelles des marchés."""
+        if not self.marches_analyzer:
+            QMessageBox.warning(
+                self,
+                "Données non chargées",
+                "Veuillez d'abord charger les données en cliquant sur 'Actualiser les données'."
+            )
+            return
+
+        from enveloppes_dialog import EnveloppesMarchesDialog
+
+        dialog = EnveloppesMarchesDialog(self.db, self.marches_analyzer, self)
+        if dialog.exec_() == QDialog.Accepted:
+            # Les enveloppes viennent de changer : les vues qui affichent un
+            # solde doivent repartir des nouveaux montants.
+            self.marches_analyzer.invalider_vision()
+            self.refresh_marches_data()
+
+    def regenerer_tous_les_suivis(self):
+        """Régénère le suivi financier de toutes les opérations dans un dossier."""
+        if not self.marches_analyzer:
+            QMessageBox.warning(
+                self,
+                "Données non chargées",
+                "Veuillez d'abord charger les données en cliquant sur 'Actualiser les données'."
+            )
+            return
+
+        operations = [op['operation'] for op in self.marches_analyzer.get_vision_operations()]
+        if not operations:
+            QMessageBox.warning(self, "Aucune opération", "Aucune opération à régénérer.")
+            return
+
+        dossier = QFileDialog.getExistingDirectory(
+            self, "Dossier de destination des suivis régénérés"
+        )
+        if not dossier:
+            return
+
+        confirmation = QMessageBox.question(
+            self,
+            "Régénérer tous les suivis",
+            f"Régénérer {len(operations)} suivi(s) financier(s) dans :\n{dossier}\n\n"
+            "Les fichiers portant le même nom seront remplacés.\n\nContinuer ?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        if confirmation != QMessageBox.Yes:
+            return
+
+        from PyQt5.QtWidgets import QProgressDialog
+
+        progression = QProgressDialog(
+            "Régénération des suivis financiers...", "Annuler", 0, len(operations), self
+        )
+        progression.setWindowTitle("Régénération en cours")
+        progression.setWindowModality(Qt.WindowModal)
+        progression.setMinimumDuration(0)
+
+        reussites, echecs = [], []
+        for index, code_operation in enumerate(operations):
+            if progression.wasCanceled():
+                break
+
+            progression.setLabelText(f"Opération {code_operation} ({index + 1}/{len(operations)})")
+            progression.setValue(index)
+            QApplication.processEvents()
+
+            filepath = os.path.join(dossier, f"suivi_financier_{code_operation}.xlsx")
+            try:
+                ok = self.marches_analyzer.export_suivi_financier_operation(
+                    code_operation, filepath, exercice_filter=None, special_export=False
+                )
+            except Exception as e:
+                print(f"[ERREUR] {code_operation} : {e}")
+                ok = False
+
+            (reussites if ok else echecs).append(code_operation)
+
+        progression.setValue(len(operations))
+        annulee = progression.wasCanceled()
+
+        message = f"{len(reussites)} suivi(s) régénéré(s) dans :\n{dossier}"
+        if annulee:
+            message = "Régénération interrompue.\n\n" + message
+        if echecs:
+            message += (f"\n\n{len(echecs)} en échec : "
+                        f"{', '.join(echecs[:8])}"
+                        + (" …" if len(echecs) > 8 else ""))
+            QMessageBox.warning(self, "Régénération terminée avec des échecs", message)
+        else:
+            QMessageBox.information(self, "Régénération terminée", message)
 
     def export_suivi_financier_operation(self):
         """Exporte le suivi financier de l'opération sélectionnée."""

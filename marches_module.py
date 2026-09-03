@@ -91,6 +91,7 @@ class MarchesAnalyzer:
             MarchesSync() if use_cache else None
         )
         self.sync_stats = None
+        self._vision_operations = None
 
     @classmethod
     def resoudre_sources(cls, excel_path) -> List[str]:
@@ -245,6 +246,9 @@ class MarchesAnalyzer:
         Returns:
             True si succès, False sinon
         """
+        # Les données changent : la vision mémorisée n'est plus valable.
+        self._vision_operations = None
+
         try:
             if self.use_cache and self.sync:
                 # Si le chemin est "database_sync", charger uniquement depuis le cache
@@ -681,9 +685,21 @@ class MarchesAnalyzer:
         # Sinon, le marché est l'opération complète
         return normalized
 
-    def get_vision_operations(self) -> List[Dict]:
+    def invalider_vision(self):
+        """Oublie la vision par opération mémorisée.
+
+        À appeler après une écriture en base qui change les montants des
+        marchés (enveloppes, avenants, tranches).
+        """
+        self._vision_operations = None
+
+    def get_vision_operations(self, force_refresh: bool = False) -> List[Dict]:
         """
         Retourne la vision par opération (regroupement de marchés/lots).
+
+        Le résultat est mémorisé : il est recalculé une fois par opération lors
+        d'un traitement en lot, ce qui coûtait 27 s pour 77 opérations.
+        `invalider_vision()` ou un `load_data()` le remet à zéro.
 
         Retourne :
         - operation : code opération
@@ -697,6 +713,9 @@ class MarchesAnalyzer:
         - pourcent_consomme
         - nb_avenants_total
         """
+        if not force_refresh and self._vision_operations is not None:
+            return self._vision_operations
+
         vision_marches = self.get_vision_globale()
 
         if not vision_marches:
@@ -775,6 +794,7 @@ class MarchesAnalyzer:
         # Trier par opération
         results.sort(key=lambda x: x['operation'])
 
+        self._vision_operations = results
         return results
 
     def get_historique_factures(self, marche: str = None) -> List[Dict]:

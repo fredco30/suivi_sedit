@@ -90,9 +90,26 @@ engagé et son facturé à ce jour — des repères pour la saisie, jamais l'env
 L'import est une simulation par défaut ; il repère ses colonnes par leur en-tête,
 accepte les montants au format français et n'écrit rien si l'un est illisible.
 
+### Depuis l'interface
+
+Deux boutons couvrent le même besoin sans passer par la ligne de commande :
+
+- **💶 Enveloppes des marchés** (onglet *Suivi des marchés*) ouvre la saisie en
+  masse : un marché par ligne, seule la colonne enveloppe est éditable, les
+  colonnes « engagé » et « facturé » ne sont que des repères. Le tableau
+  s'exporte et se réimporte en `.xlsx` pour une saisie hors application, et rien
+  n'est écrit tant que « Enregistrer » n'est pas cliqué.
+- **🔁 Tout régénérer** (onglet *Opérations*) régénère toutes les opérations dans
+  un dossier au choix, avec barre de progression et annulation.
+
 ### Tests
+
+L'interface est testée sans affichage (`QT_QPA_PLATFORM=offscreen`) ;
+`test_interface.py` est ignoré si PyQt5 n'est pas installé.
+
 
 ```bash
 python -m unittest test_suivi_financier.py -v
 python -m unittest test_matching.py -v
+python -m unittest test_interface.py -v
 ```

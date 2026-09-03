@@ -49,6 +49,26 @@ EN_TETES = [
 ]
 
 
+def parser_montant(brut) -> Optional[float]:
+    """Lit un montant saisi a la main, ou None si la cellule est vide.
+
+    Accepte les formes qui reviennent d'un tableur : « 12 345,67 € »,
+    « 12345.67 », un nombre. Leve ValueError si le texte n'est pas un montant.
+    """
+    if brut is None:
+        return None
+    if isinstance(brut, (int, float)):
+        return float(brut) or None
+
+    texte = str(brut).strip()
+    if not texte:
+        return None
+
+    texte = (texte.replace("\u202f", "").replace("\u00a0", "")
+                  .replace("€", "").replace(" ", "").replace(",", "."))
+    return float(texte) or None
+
+
 def collecter_marches(analyzer: MarchesAnalyzer) -> List[Dict]:
     """Dresse l'inventaire des marchés vus dans les écritures, avec leurs repères."""
     par_marche: Dict[str, Dict] = {}
@@ -207,16 +227,13 @@ def importer(fichier: str, db_path: str, appliquer: bool = False) -> int:
             continue
         code = str(code).strip()
 
-        brut = ws.cell(ligne, col_montant).value
-        if brut is None or str(brut).strip() == "":
-            ignores.append(code)
-            continue
         try:
-            montant = float(str(brut).replace("€", "").replace(" ", "").replace(",", "."))
+            montant = parser_montant(ws.cell(ligne, col_montant).value)
         except ValueError:
-            print(f"[ERREUR] Ligne {ligne} ({code}) : montant illisible {brut!r}")
+            print(f"[ERREUR] Ligne {ligne} ({code}) : montant illisible "
+                  f"{ws.cell(ligne, col_montant).value!r}")
             return 1
-        if montant <= 0:
+        if montant is None or montant <= 0:
             ignores.append(code)
             continue
 
