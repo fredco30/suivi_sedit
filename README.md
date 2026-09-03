@@ -124,10 +124,37 @@ Deux boutons couvrent le même besoin sans passer par la ligne de commande :
 - **🔁 Tout régénérer** (onglet *Opérations*) régénère toutes les opérations dans
   un dossier au choix, avec barre de progression et annulation.
 
+### Filtres (Commandes, Rappels, Factures, Facturation)
+
+Les filtres **Marché** et **Fournisseur** sont à sélection multiple avec
+recherche (`SearchableCheckableComboBox`) : cliquer ouvre une liste à cases à
+cocher avec un champ de recherche en tête, nécessaire dès que la centaine de
+marchés ou de fournisseurs du dépôt rend une liste plate illisible. L'option
+« [Tous] » coche/décoche l'intégralité de la liste, y compris ce qu'une
+recherche en cours masque à l'écran.
+
+L'onglet **Facturation** a un filtre **Exercice** fonctionnel : la colonne
+existe dans le tableau (`FACTURATION_COLUMNS`) mais n'était filtrable nulle
+part.
+
+Chaque groupe de filtres qui doit apparaître/disparaître selon l'onglet actif
+(Facturation/Exercice, Marché, les filtres multiples de Commandes, les deux
+champs de recherche) est sa **propre `QToolBar`**, montrée/cachée dans son
+ensemble plutôt qu'un widget isolé au sein d'une toolbar partagée. Cacher un
+widget nu ajouté via `QToolBar.addWidget()` s'est révélé peu fiable : Qt
+resynchronise chaque widget sur l'état de sa propre `QAction` dès qu'un widget
+*sibling* de la même toolbar change de visibilité, ce qui pouvait laisser
+apparaître un filtre masqué par erreur — c'est ce qui produisait un filtre
+« Exercice » vide et non fonctionnel sur l'onglet Facturation. Cacher une
+toolbar entière n'a pas ce problème. Pour la même raison, l'initialisation des
+filtres du premier onglet est différée au premier `showEvent()` plutôt
+qu'appelée pendant la construction de la fenêtre.
+
 ### Tests
 
 L'interface est testée sans affichage (`QT_QPA_PLATFORM=offscreen`) ;
-`test_interface.py` est ignoré si PyQt5 n'est pas installé.
+`test_interface.py` et `test_filtres_ui.py` sont ignorés si PyQt5 n'est pas
+installé.
 
 
 ```bash
@@ -135,4 +162,5 @@ python -m unittest test_suivi_financier.py -v
 python -m unittest test_matching.py -v
 python -m unittest test_interface.py -v
 python -m unittest test_lanceur.py -v
+python -m unittest test_filtres_ui.py -v
 ```
