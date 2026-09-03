@@ -1,6 +1,23 @@
 # suivi_march-
 Logiciel de gestion pour suivi des marchés
 
+## Démarrer l'application
+
+Sous Windows, double-cliquer **`Lancer_suivi_marches.cmd`**. Il repère Python,
+installe les dépendances manquantes, puis démarre l'application en journalisant
+dans `run_logs\`. En cas d'échec, le journal s'ouvre automatiquement.
+
+```
+Lancer_suivi_marches.cmd            lance l'application
+Lancer_suivi_marches.cmd --maj      réinstalle les dépendances puis lance
+Lancer_suivi_marches.cmd --verif    vérifie seulement, ne lance rien
+```
+
+La logique est dans `lanceur.py` (utilisable seul : `python lanceur.py --verif`) ;
+le `.cmd` ne fait que trouver Python. Si `pip` refuse les versions figées de
+`requirements.txt` — `pandas==2.1.4` n'a pas de binaire au-delà de Python 3.12 —
+le lanceur réessaie en les traitant comme des minima et le signale.
+
 ## Suivi financier par opération
 
 L'export « suivi financier » émet **une ligne par état de bon de commande**,
@@ -112,4 +129,5 @@ L'interface est testée sans affichage (`QT_QPA_PLATFORM=offscreen`) ;
 python -m unittest test_suivi_financier.py -v
 python -m unittest test_matching.py -v
 python -m unittest test_interface.py -v
+python -m unittest test_lanceur.py -v
 ```
