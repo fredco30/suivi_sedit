@@ -5699,7 +5699,11 @@ class MainWindow(QMainWindow):
         try:
             sync = MarchesSync()
             stats = sync.sync_from_excel("database_sync", df, force=True)
-            print(f"[SYNC CACHE] {stats['nb_inserted']} insérées, {stats['nb_deleted']} supprimées")
+            # La base fait autorité : le cache ne garde aucune ligne provenant
+            # d'un export Excel synchronisé par ailleurs.
+            nb_elaguees = sync.prune_sources(["database_sync"])
+            print(f"[SYNC CACHE] {stats['nb_inserted']} insérées, "
+                  f"{stats['nb_deleted'] + nb_elaguees} supprimées")
         except Exception as e:
             # Si l'erreur est due au fichier inexistant, on peut l'ignorer
             # car on utilise un chemin factice pour la base de données

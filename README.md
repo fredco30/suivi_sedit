@@ -32,8 +32,28 @@ de la génération Excel.
 | AL / AT — `Facture` / `Mandat` | Une ligne est une réalisation si les deux sont renseignés. |
 | AM — `Commande` | N° de BDC, renseigné seulement quand la ligne a été rattachée à une commande. |
 
+### Charger plusieurs exports SEDIT
+
 Les exports SEDIT sont annuels et se recouvrent : le suivi d'une opération
 pluriannuelle se lit sur leur **réunion**, pas sur un seul fichier.
+`MarchesAnalyzer` accepte donc un fichier, un motif, un répertoire, ou une liste
+de ces formes :
+
+```python
+MarchesAnalyzer("data_sources/factures*.xls", database=db)
+MarchesAnalyzer("data_sources", database=db)
+MarchesAnalyzer(["factures_2024.xls", "factures_2025.xls"], database=db)
+MarchesAnalyzer("database_sync", database=db)   # lit le cache existant
+```
+
+Chaque fichier est synchronisé indépendamment : le cache retient sa provenance,
+une ligne présente dans plusieurs exports n'est stockée qu'une fois, et
+synchroniser un fichier ne retire jamais les lignes des autres. Un fichier
+retiré de la sélection voit ses lignes sortir du cache — sauf celles qu'un autre
+export porte encore.
+
+Un `cache_path` permet de désigner le fichier de cache, pour qu'un traitement en
+lot ne modifie pas celui de l'application.
 
 ### Régénérer les suivis déjà diffusés
 
@@ -43,6 +63,7 @@ consommée. Pour les régénérer :
 ```bash
 python regenerer_suivis.py --tout --sortie exports/
 python regenerer_suivis.py 2020_14G3P --sortie exports/
+python regenerer_suivis.py --tout --source "data_sources/factures*.xls" --sortie exports/
 python regenerer_suivis.py --lister
 ```
 

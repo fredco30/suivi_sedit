@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import glob
 import os
+import shutil
 import tempfile
 import unittest
 from collections import defaultdict
@@ -297,7 +298,7 @@ def _charger_analyzer():
     """Analyzer sur le jeu de reference, ou None si les sources sont absentes.
 
     Les exports SEDIT sont annuels et se recouvrent ; le suivi d'une operation
-    pluriannuelle se lit sur leur reunion. On la reconstitue ici dans un cache
+    pluriannuelle se lit sur leur reunion. On les charge tous, dans un cache
     temporaire, sans toucher au cache de travail de l'application.
     """
     if _ANALYZER_CACHE:
@@ -307,23 +308,17 @@ def _charger_analyzer():
     if not sources or not os.path.exists("suivi_commandes.db"):
         return None
     try:
-        import pandas as pd
         from marches_module import MarchesAnalyzer
-        from marches_sync import MarchesSync
         from regenerer_suivis import BaseSuiviLectureSeule
     except ImportError:
         return None
 
-    repertoire = tempfile.mkdtemp()
-    consolide = os.path.join(repertoire, "factures_consolidees.xlsx")
-    pd.concat([pd.read_excel(source) for source in sources], ignore_index=True) \
-        .drop_duplicates() \
-        .to_excel(consolide, index=False)
-
     analyzer = MarchesAnalyzer(
-        consolide, database=BaseSuiviLectureSeule("suivi_commandes.db"), use_cache=True
+        sources,
+        database=BaseSuiviLectureSeule("suivi_commandes.db"),
+        use_cache=True,
+        cache_path=os.path.join(tempfile.mkdtemp(), "cache_test.db"),
     )
-    analyzer.sync = MarchesSync(os.path.join(repertoire, "cache_test.db"))
     if not analyzer.load_data(force_reload=True):
         return None
 
@@ -643,6 +638,163 @@ class TestValeursReference2020_14G3P(unittest.TestCase):
             self.enveloppe - self.resultat.total_impute,
             self.ATTENDU["solde_final"], places=2,
         )
+
+
+class TestSynchronisationMultiFichiers(unittest.TestCase):
+    """Un export SEDIT est annuel : le suivi se lit sur la reunion des exports.
+
+    La synchronisation devait donc cesser de traiter un fichier comme la
+    totalite du cache -- elle supprimait les lignes de tous les autres.
+    """
+
+    LARGEUR = 50
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import pandas as pd
+            from marches_module import MarchesAnalyzer
+        except ImportError:
+            raise unittest.SkipTest("pandas indisponible")
+        cls.pd = pd
+        cls.MarchesAnalyzer = MarchesAnalyzer
+
+    def setUp(self):
+        self.repertoire = tempfile.mkdtemp()
+        self.cache = os.path.join(self.repertoire, "cache.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.repertoire, ignore_errors=True)
+
+    def _ecrire_export(self, nom, lignes):
+        """Ecrit un export SEDIT minimal : (bdc, libelle, ttc, facture, mandat)."""
+        colonnes = self.MarchesAnalyzer
+        contenu = []
+        for bdc, libelle, ttc, facture, mandat in lignes:
+            ligne = [None] * self.LARGEUR
+            ligne[colonnes.COL_CODE_MOUVEMENT] = bdc
+            ligne[colonnes.COL_FOURNISSEUR] = FOURNISSEUR
+            ligne[colonnes.COL_LIBELLE] = libelle
+            ligne[colonnes.COL_MONTANT_INITIAL] = ttc
+            ligne[colonnes.COL_MONTANT_TTC] = ttc
+            ligne[colonnes.COL_MONTANT_SF] = ttc if facture else 0
+            ligne[colonnes.COL_FACTURE] = facture
+            ligne[colonnes.COL_MANDAT] = mandat
+            ligne[colonnes.COL_MARCHE] = MARCHE
+            contenu.append(ligne)
+
+        chemin = os.path.join(self.repertoire, nom)
+        # La 1re ligne du fichier sert d'en-tete a pandas, comme un export SEDIT.
+        entete = [f"col{i}" for i in range(self.LARGEUR)]
+        self.pd.DataFrame(contenu, columns=entete).to_excel(chemin, index=False)
+        return chemin
+
+    def _charger(self, sources, force=False):
+        analyzer = self.MarchesAnalyzer(sources, use_cache=True, cache_path=self.cache)
+        self.assertTrue(analyzer.load_data(force_reload=force))
+        return analyzer
+
+    def test_les_exports_annuels_se_cumulent(self):
+        a = self._ecrire_export("2024.xlsx", [("24AA00001", "borne", 1000.0, None, None)])
+        b = self._ecrire_export("2025.xlsx", [("25AA00002", "mât", 2000.0, "F1", "M1")])
+
+        analyzer = self._charger([a, b])
+        self.assertEqual(len(analyzer.df_marches), 2)
+        self.assertEqual(sorted(analyzer.sync.list_sources()), sorted([a, b]))
+
+    def test_une_ligne_presente_dans_deux_exports_n_est_stockee_qu_une_fois(self):
+        # Cas reel : un engagement non solde est reconduit d'un exercice sur
+        # l'autre et figure a l'identique dans les deux exports.
+        commune = ("24AA00001", "borne", 1000.0, None, None)
+        a = self._ecrire_export("2024.xlsx", [commune])
+        b = self._ecrire_export("2025.xlsx", [commune, ("25AA00002", "mât", 2000.0, "F1", "M1")])
+
+        analyzer = self._charger([a, b])
+        self.assertEqual(len(analyzer.df_marches), 2)
+
+    def test_synchroniser_un_export_ne_supprime_pas_les_lignes_des_autres(self):
+        a = self._ecrire_export("2024.xlsx", [("24AA00001", "borne", 1000.0, None, None)])
+        b = self._ecrire_export("2025.xlsx", [("25AA00002", "mât", 2000.0, "F1", "M1")])
+        self._charger([a, b])
+
+        # L'export 2025 est remplacé par une version modifiée : seules ses
+        # propres lignes doivent bouger.
+        os.remove(b)
+        b = self._ecrire_export("2025.xlsx", [("25AA00003", "coffret", 3000.0, "F2", "M2")])
+
+        analyzer = self._charger([a, b], force=True)
+        bdcs = set(analyzer.df_marches.iloc[:, self.MarchesAnalyzer.COL_COMMANDE])
+        self.assertEqual(bdcs, {"24AA00001", "25AA00003"})
+
+    def test_retirer_un_export_de_la_selection_retire_ses_lignes(self):
+        a = self._ecrire_export("2024.xlsx", [("24AA00001", "borne", 1000.0, None, None)])
+        b = self._ecrire_export("2025.xlsx", [("25AA00002", "mât", 2000.0, "F1", "M1")])
+        self._charger([a, b])
+
+        analyzer = self._charger([a])
+        self.assertEqual(len(analyzer.df_marches), 1)
+        self.assertEqual(analyzer.sync.list_sources(), [a])
+
+    def test_une_ligne_partagee_survit_au_retrait_d_un_seul_export(self):
+        commune = ("24AA00001", "borne", 1000.0, None, None)
+        a = self._ecrire_export("2024.xlsx", [commune])
+        b = self._ecrire_export("2025.xlsx", [commune])
+        self._charger([a, b])
+
+        analyzer = self._charger([a])
+        self.assertEqual(len(analyzer.df_marches), 1)
+
+    def test_second_chargement_ne_resynchronise_rien(self):
+        a = self._ecrire_export("2024.xlsx", [("24AA00001", "borne", 1000.0, None, None)])
+        self._charger([a])
+
+        analyzer = self._charger([a])
+        self.assertEqual(analyzer.sync_stats["nb_inserted"], 0)
+        self.assertEqual(analyzer.sync_stats["nb_deleted"], 0)
+
+    def test_source_introuvable_signalee(self):
+        analyzer = self.MarchesAnalyzer(
+            os.path.join(self.repertoire, "aucun*.xlsx"), use_cache=True, cache_path=self.cache
+        )
+        self.assertFalse(analyzer.load_data())
+
+
+class TestResolutionSources(unittest.TestCase):
+    """Une source peut etre un fichier, un motif, un repertoire ou une liste."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from marches_module import MarchesAnalyzer
+        except ImportError:
+            raise unittest.SkipTest("marches_module indisponible")
+        cls.resoudre = MarchesAnalyzer.resoudre_sources
+
+    def setUp(self):
+        self.repertoire = tempfile.mkdtemp()
+        for nom in ("factures_2024.xlsx", "factures_2025.xlsx", "notes.txt"):
+            open(os.path.join(self.repertoire, nom), "w").close()
+
+    def tearDown(self):
+        shutil.rmtree(self.repertoire, ignore_errors=True)
+
+    def test_repertoire_developpe_en_fichiers_excel(self):
+        resolus = self.resoudre(self.repertoire)
+        self.assertEqual([os.path.basename(c) for c in resolus],
+                         ["factures_2024.xlsx", "factures_2025.xlsx"])
+
+    def test_motif_developpe(self):
+        resolus = self.resoudre(os.path.join(self.repertoire, "factures_*.xlsx"))
+        self.assertEqual(len(resolus), 2)
+
+    def test_liste_sans_doublon_et_ordre_stable(self):
+        fichier = os.path.join(self.repertoire, "factures_2024.xlsx")
+        resolus = self.resoudre([fichier, self.repertoire])
+        self.assertEqual([os.path.basename(c) for c in resolus],
+                         ["factures_2024.xlsx", "factures_2025.xlsx"])
+
+    def test_mot_cle_database_sync_ne_designe_aucun_fichier(self):
+        self.assertEqual(self.resoudre("database_sync"), [])
 
 
 if __name__ == "__main__":

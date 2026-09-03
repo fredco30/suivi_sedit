@@ -75,7 +75,50 @@ class MarchesSync:
             )
         """)
 
+        # Provenance des lignes : un export SEDIT est annuel, une même ligne
+        # peut donc être présente dans plusieurs fichiers. La ligne n'est
+        # stockée qu'une fois (hash_ligne unique) mais reste rattachée à chacun
+        # de ses fichiers d'origine, pour que la synchronisation d'un fichier ne
+        # supprime jamais les lignes des autres.
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS lignes_sources (
+                hash_ligne TEXT NOT NULL,
+                fichier_path TEXT NOT NULL,
+                PRIMARY KEY (hash_ligne, fichier_path)
+            )
+        """)
+        cursor.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sources_fichier ON lignes_sources(fichier_path)"
+        )
+
+        self._reprendre_cache_mono_fichier(cursor)
         self.conn.commit()
+
+    def _reprendre_cache_mono_fichier(self, cursor):
+        """Rattache les lignes d'un cache antérieur à leur fichier d'origine.
+
+        Les caches créés avant le suivi de provenance ne portent aucune
+        association. On les rattache au dernier fichier synchronisé, de sorte
+        qu'un cache existant se comporte exactement comme avant.
+        """
+        cursor.execute("SELECT COUNT(*) FROM lignes_sources")
+        if cursor.fetchone()[0]:
+            return
+
+        cursor.execute("SELECT COUNT(*) FROM lignes_factures")
+        if not cursor.fetchone()[0]:
+            return
+
+        cursor.execute("SELECT fichier_path FROM sync_info ORDER BY id DESC LIMIT 1")
+        derniere = cursor.fetchone()
+        if not derniere or not derniere[0]:
+            return
+
+        cursor.execute(
+            "INSERT OR IGNORE INTO lignes_sources (hash_ligne, fichier_path) "
+            "SELECT hash_ligne, ? FROM lignes_factures",
+            (derniere[0],)
+        )
 
     def _calculate_file_hash(self, filepath: str) -> str:
         """
@@ -242,14 +285,16 @@ class MarchesSync:
                 """, rows_to_insert)
                 stats['nb_inserted'] = len(rows_to_insert)
 
-            # Supprimer les lignes qui n'existent plus dans le fichier
-            hashes_to_delete = existing_hashes - new_hashes
-            if hashes_to_delete:
-                cursor.execute(
-                    f"DELETE FROM lignes_factures WHERE hash_ligne IN ({','.join('?' * len(hashes_to_delete))})",
-                    list(hashes_to_delete)
-                )
-                stats['nb_deleted'] = len(hashes_to_delete)
+            # Rattacher les lignes à ce fichier : ses associations sont
+            # remplacées, celles des autres fichiers restent intactes.
+            cursor.execute("DELETE FROM lignes_sources WHERE fichier_path = ?", (filepath,))
+            cursor.executemany(
+                "INSERT OR IGNORE INTO lignes_sources (hash_ligne, fichier_path) VALUES (?, ?)",
+                [(h, filepath) for h in new_hashes]
+            )
+
+            # Ne supprimer que les lignes que plus aucun fichier ne porte.
+            stats['nb_deleted'] = self._supprimer_lignes_orphelines(cursor)
 
             # Mettre à jour sync_info
             # Gérer le cas où le filepath est factice (sync depuis database)
@@ -288,6 +333,49 @@ class MarchesSync:
 
         stats['duration'] = (datetime.now() - start_time).total_seconds()
         return stats
+
+    def _supprimer_lignes_orphelines(self, cursor) -> int:
+        """Supprime les lignes qu'aucun fichier source ne porte plus."""
+        cursor.execute("""
+            DELETE FROM lignes_factures
+            WHERE hash_ligne NOT IN (SELECT hash_ligne FROM lignes_sources)
+        """)
+        return cursor.rowcount if cursor.rowcount and cursor.rowcount > 0 else 0
+
+    def list_sources(self) -> List[str]:
+        """Fichiers actuellement représentés dans le cache."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT DISTINCT fichier_path FROM lignes_sources ORDER BY fichier_path")
+        return [row[0] for row in cursor.fetchall()]
+
+    def forget_source(self, filepath: str) -> int:
+        """Retire un fichier du cache et les lignes qu'il était seul à porter.
+
+        Returns:
+            Nombre de lignes effectivement supprimées.
+        """
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM lignes_sources WHERE fichier_path = ?", (filepath,))
+        cursor.execute("DELETE FROM sync_info WHERE fichier_path = ?", (filepath,))
+        nb_supprimees = self._supprimer_lignes_orphelines(cursor)
+        self.conn.commit()
+        return nb_supprimees
+
+    def prune_sources(self, filepaths: List[str]) -> int:
+        """Ne conserve dans le cache que les fichiers listés.
+
+        Appelée après une synchronisation multi-fichiers : un fichier retiré de
+        la sélection ne doit plus peser sur le suivi.
+
+        Returns:
+            Nombre de lignes supprimées.
+        """
+        conserves = set(filepaths)
+        nb_supprimees = 0
+        for source in self.list_sources():
+            if source not in conserves:
+                nb_supprimees += self.forget_source(source)
+        return nb_supprimees
 
     def load_to_dataframe(self, marche_filter: Optional[str] = None) -> pd.DataFrame:
         """
@@ -344,6 +432,7 @@ class MarchesSync:
         """Vide complètement le cache SQLite."""
         cursor = self.conn.cursor()
         cursor.execute("DELETE FROM lignes_factures")
+        cursor.execute("DELETE FROM lignes_sources")
         cursor.execute("DELETE FROM sync_info")
         self.conn.commit()
 

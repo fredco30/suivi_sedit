@@ -4,6 +4,8 @@ Calcule la vision globale par marché et le détail par tranche
 Avec synchronisation SQLite pour optimiser les performances
 """
 
+import os
+
 import pandas as pd
 import numpy as np
 from typing import List, Dict, Tuple, Optional
@@ -59,22 +61,69 @@ class MarchesAnalyzer:
     # groupe l'emporte sur l'en-tête.
     RANG_PROVENANCE = {ENVELOPPE_BASE: 0, ENVELOPPE_SEDIT: 1, ENVELOPPE_ABSENTE: 2}
 
-    def __init__(self, excel_path: str, database=None, use_cache: bool = True):
+    SOURCE_DATABASE = "database_sync"
+    EXTENSIONS_EXCEL = (".xls", ".xlsx", ".xlsm")
+
+    def __init__(self, excel_path, database=None, use_cache: bool = True,
+                 cache_path: Optional[str] = None):
         """
-        Initialise l'analyseur avec le chemin du fichier Excel.
+        Initialise l'analyseur avec la ou les sources de factures.
 
         Args:
-            excel_path: Chemin vers le fichier Excel des factures
+            excel_path: Source des factures. Accepte un chemin de fichier, un
+                motif (`data_sources/factures*.xls`), un répertoire, une liste
+                de ces formes, ou le mot-clé "database_sync" pour ne lire que
+                le cache. Les exports SEDIT étant annuels, le suivi d'une
+                opération pluriannuelle se lit sur leur réunion.
             database: Instance de Database pour accéder aux ajustements manuels (optionnel)
             use_cache: Utiliser le cache SQLite (True par défaut)
+            cache_path: Fichier de cache SQLite à utiliser. Par défaut celui de
+                l'application ; un traitement en lot a intérêt à en nommer un
+                autre pour ne pas modifier le cache de travail.
         """
         self.excel_path = excel_path
         self.df = None
         self.df_marches = None
         self.db = database
         self.use_cache = use_cache
-        self.sync = MarchesSync() if use_cache else None
+        self.cache_path = cache_path
+        self.sync = MarchesSync(cache_path) if use_cache and cache_path else (
+            MarchesSync() if use_cache else None
+        )
         self.sync_stats = None
+
+    @classmethod
+    def resoudre_sources(cls, excel_path) -> List[str]:
+        """Développe une source en liste de fichiers Excel, sans doublon.
+
+        Un répertoire est développé en ses fichiers Excel, un motif en ses
+        correspondances ; l'ordre est stable pour que deux chargements
+        successifs produisent le même cache.
+        """
+        import glob as _glob
+
+        entrees = [excel_path] if isinstance(excel_path, str) else list(excel_path or [])
+        fichiers: List[str] = []
+
+        for entree in entrees:
+            entree = str(entree)
+            if entree == cls.SOURCE_DATABASE:
+                continue
+            if os.path.isdir(entree):
+                trouves = [
+                    chemin for chemin in sorted(_glob.glob(os.path.join(entree, "*")))
+                    if chemin.lower().endswith(cls.EXTENSIONS_EXCEL)
+                ]
+            elif any(joker in entree for joker in "*?["):
+                trouves = sorted(_glob.glob(entree))
+            else:
+                trouves = [entree]
+
+            for chemin in trouves:
+                if chemin not in fichiers:
+                    fichiers.append(chemin)
+
+        return fichiers
 
     @staticmethod
     def extract_exercice_from_bdc(num_commande) -> str:
@@ -119,9 +168,76 @@ class MarchesAnalyzer:
         vide = commande.isna() | (commande.astype(str).str.strip() == '')
         return commande.mask(vide, mouvement)
 
+    def _preparer_lignes_a_synchroniser(self, df_excel: pd.DataFrame) -> pd.DataFrame:
+        """Extrait d'un export SEDIT les colonnes conservées dans le cache."""
+        df_to_sync = df_excel[
+            df_excel.iloc[:, self.COL_MARCHE].notna() &
+            (df_excel.iloc[:, self.COL_MARCHE] != '')
+        ].copy()
+
+        return pd.DataFrame({
+            'marche': df_to_sync.iloc[:, self.COL_MARCHE],
+            'fournisseur': df_to_sync.iloc[:, self.COL_FOURNISSEUR],
+            'libelle': df_to_sync.iloc[:, self.COL_LIBELLE],
+            'date_sf': df_to_sync.iloc[:, self.COL_DATE_SF],
+            'num_facture': df_to_sync.iloc[:, self.COL_FACTURE],
+            'montant_initial': df_to_sync.iloc[:, self.COL_MONTANT_INITIAL],
+            'montant_sf': df_to_sync.iloc[:, self.COL_MONTANT_SF],
+            'montant_ttc': df_to_sync.iloc[:, self.COL_MONTANT_TTC],
+            'num_mandat': df_to_sync.iloc[:, self.COL_MANDAT],
+            'tranche': df_to_sync.iloc[:, self.COL_TRANCHE],
+            'commande': self._resoudre_num_bdc(df_to_sync),
+        })
+
+    def _synchroniser_sources(self, sources: List[str], force_reload: bool) -> Dict:
+        """Synchronise chaque fichier source vers le cache et cumule les stats.
+
+        Chaque fichier est traité indépendamment : une ligne présente dans
+        plusieurs exports annuels n'est stockée qu'une fois, et la
+        synchronisation de l'un ne retire jamais les lignes des autres.
+        """
+        cumul = {
+            'nb_inserted': 0, 'nb_updated': 0, 'nb_unchanged': 0, 'nb_deleted': 0,
+            'duration': 0.0, 'status': 'success', 'sources': [], 'nb_sources': len(sources),
+        }
+
+        for source in sources:
+            needs_sync, reason = self.sync.file_needs_sync(source)
+            if not (needs_sync or force_reload):
+                print(f"[CACHE] {source} : {reason}")
+                cumul['sources'].append({'fichier': source, 'status': 'cached', 'message': reason})
+                continue
+
+            print(f"[SYNC] {source} : {reason}")
+            try:
+                df_excel = pd.read_excel(source)
+            except Exception as e:
+                print(f"[ERREUR] Lecture impossible de {source} : {e}")
+                cumul['status'] = 'partial'
+                cumul['sources'].append({'fichier': source, 'status': 'error', 'message': str(e)})
+                continue
+
+            stats = self.sync.sync_from_excel(
+                source, self._preparer_lignes_a_synchroniser(df_excel), force=force_reload
+            )
+            stats['fichier'] = source
+            cumul['sources'].append(stats)
+
+            if stats.get('status') == 'error':
+                cumul['status'] = 'partial'
+                continue
+
+            for cle in ('nb_inserted', 'nb_updated', 'nb_unchanged', 'nb_deleted', 'duration'):
+                cumul[cle] += stats.get(cle, 0)
+
+        print(f"[OK] Sync terminee sur {len(sources)} fichier(s) : "
+              f"{cumul['nb_inserted']} inserees, {cumul['nb_deleted']} supprimees, "
+              f"{cumul['nb_unchanged']} inchangees (duree: {cumul['duration']:.2f}s)")
+        return cumul
+
     def load_data(self, force_reload: bool = False):
         """
-        Charge les données depuis le fichier Excel avec synchronisation SQLite.
+        Charge les données depuis le ou les fichiers Excel, via le cache SQLite.
 
         Args:
             force_reload: Force le rechargement depuis Excel même si le cache est valide
@@ -133,55 +249,22 @@ class MarchesAnalyzer:
             if self.use_cache and self.sync:
                 # Si le chemin est "database_sync", charger uniquement depuis le cache
                 # (les données ont déjà été synchronisées depuis la base de données)
-                if self.excel_path == "database_sync":
+                if self.excel_path == self.SOURCE_DATABASE:
                     print(f"[CACHE] Chargement depuis le cache (source: database)")
                     self.sync_stats = {'status': 'cached', 'message': 'Données depuis database'}
                 else:
-                    # Vérifier si synchronisation nécessaire
-                    needs_sync, reason = self.sync.file_needs_sync(self.excel_path)
+                    sources = self.resoudre_sources(self.excel_path)
+                    if not sources:
+                        print(f"[ERREUR] Aucun fichier source trouvé pour {self.excel_path!r}")
+                        return False
 
-                    if needs_sync or force_reload:
-                        print(f"[SYNC] Synchronisation necessaire: {reason}")
+                    # Un fichier retiré de la sélection ne doit plus peser sur
+                    # le suivi : ses lignes sortent du cache.
+                    nb_elaguees = self.sync.prune_sources(sources)
+                    if nb_elaguees:
+                        print(f"[SYNC] {nb_elaguees} lignes retirées (fichiers hors sélection)")
 
-                        # Charger depuis Excel pour synchroniser
-                        df_excel = pd.read_excel(self.excel_path)
-
-                        # Préparer les données pour la synchronisation
-                        df_to_sync = df_excel[
-                            df_excel.iloc[:, self.COL_MARCHE].notna() &
-                            (df_excel.iloc[:, self.COL_MARCHE] != '')
-                        ].copy()
-
-                        # Renommer les colonnes pour correspondre au schéma SQLite
-                        df_to_sync_renamed = pd.DataFrame({
-                            'marche': df_to_sync.iloc[:, self.COL_MARCHE],
-                            'fournisseur': df_to_sync.iloc[:, self.COL_FOURNISSEUR],
-                            'libelle': df_to_sync.iloc[:, self.COL_LIBELLE],
-                            'date_sf': df_to_sync.iloc[:, self.COL_DATE_SF],
-                            'num_facture': df_to_sync.iloc[:, self.COL_FACTURE],
-                            'montant_initial': df_to_sync.iloc[:, self.COL_MONTANT_INITIAL],
-                            'montant_sf': df_to_sync.iloc[:, self.COL_MONTANT_SF],
-                            'montant_ttc': df_to_sync.iloc[:, self.COL_MONTANT_TTC],
-                            'num_mandat': df_to_sync.iloc[:, self.COL_MANDAT],
-                            'tranche': df_to_sync.iloc[:, self.COL_TRANCHE],
-                            'commande': self._resoudre_num_bdc(df_to_sync),
-                        })
-
-                        # Synchroniser vers SQLite
-                        self.sync_stats = self.sync.sync_from_excel(
-                            self.excel_path,
-                            df_to_sync_renamed,
-                            force=force_reload
-                        )
-
-                        print(f"[OK] Sync terminee: {self.sync_stats['nb_inserted']} inserees, "
-                              f"{self.sync_stats['nb_deleted']} supprimees, "
-                              f"{self.sync_stats['nb_unchanged']} inchangees "
-                              f"(duree: {self.sync_stats['duration']:.2f}s)")
-
-                    else:
-                        print(f"[CACHE] Chargement depuis le cache SQLite: {reason}")
-                        self.sync_stats = {'status': 'cached', 'message': reason}
+                    self.sync_stats = self._synchroniser_sources(sources, force_reload)
 
                 # Charger depuis SQLite (beaucoup plus rapide)
                 df_from_cache = self.sync.load_to_dataframe()
@@ -215,7 +298,13 @@ class MarchesAnalyzer:
             else:
                 # Mode sans cache (chargement direct depuis Excel)
                 print("📂 Chargement direct depuis Excel (cache désactivé)")
-                self.df = pd.read_excel(self.excel_path)
+                sources = self.resoudre_sources(self.excel_path)
+                if not sources:
+                    print(f"[ERREUR] Aucun fichier source trouvé pour {self.excel_path!r}")
+                    return False
+                self.df = pd.concat(
+                    [pd.read_excel(source) for source in sources], ignore_index=True
+                ).drop_duplicates()
                 self.df_marches = self.df[
                     self.df.iloc[:, self.COL_MARCHE].notna() &
                     (self.df.iloc[:, self.COL_MARCHE] != '')

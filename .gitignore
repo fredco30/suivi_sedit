@@ -5,3 +5,4 @@ __pycache__/
 *.tmp
 .DS_Store
 .claude/settings.local.json
+regeneration_cache.db

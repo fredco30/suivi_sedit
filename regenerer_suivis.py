@@ -10,6 +10,7 @@ compris.
 Exemples :
     python regenerer_suivis.py --tout
     python regenerer_suivis.py 2020_14G3P --sortie exports/
+    python regenerer_suivis.py --tout --source "data_sources/factures*.xls"
     python regenerer_suivis.py --lister
 """
 from __future__ import annotations
@@ -24,6 +25,10 @@ from marches_module import MarchesAnalyzer
 
 DB_PAR_DEFAUT = "suivi_commandes.db"
 SOURCE_PAR_DEFAUT = "database_sync"
+CACHE_APPLICATION = "marches_cache.db"
+# Cache dédié : charger des exports SEDIT en lot ne doit pas remplacer le cache
+# de travail de l'application.
+CACHE_REGENERATION = "regeneration_cache.db"
 
 
 class BaseSuiviLectureSeule:
@@ -83,8 +88,18 @@ class BaseSuiviLectureSeule:
         self.conn.close()
 
 
-def construire_analyzer(source: str, db_path: str) -> MarchesAnalyzer:
-    analyzer = MarchesAnalyzer(source, database=BaseSuiviLectureSeule(db_path), use_cache=True)
+def cache_par_defaut(source) -> str:
+    """Cache de l'application en lecture seule, cache dédié dès qu'on charge des exports."""
+    sources = [source] if isinstance(source, str) else list(source or [])
+    return CACHE_APPLICATION if sources == [SOURCE_PAR_DEFAUT] else CACHE_REGENERATION
+
+
+def construire_analyzer(source, db_path: str, cache_path: Optional[str] = None) -> MarchesAnalyzer:
+    cache_path = cache_path or cache_par_defaut(source)
+    print(f"[CACHE] {cache_path}")
+    analyzer = MarchesAnalyzer(
+        source, database=BaseSuiviLectureSeule(db_path), use_cache=True, cache_path=cache_path
+    )
     if not analyzer.load_data():
         raise RuntimeError(f"Chargement des données impossible depuis « {source} »")
     return analyzer
@@ -97,12 +112,13 @@ def lister_operations(analyzer: MarchesAnalyzer) -> List[str]:
 def regenerer(
     operations: Optional[List[str]] = None,
     sortie: str = ".",
-    source: str = SOURCE_PAR_DEFAUT,
+    source=SOURCE_PAR_DEFAUT,
     db_path: str = DB_PAR_DEFAUT,
     exercice: Optional[str] = None,
+    cache_path: Optional[str] = None,
 ) -> int:
     """Regenere les suivis demandes. Retourne le nombre d'echecs."""
-    analyzer = construire_analyzer(source, db_path)
+    analyzer = construire_analyzer(source, db_path, cache_path)
     cibles = operations or lister_operations(analyzer)
 
     os.makedirs(sortie, exist_ok=True)
@@ -127,14 +143,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--tout", action="store_true", help="Régénérer toutes les opérations")
     parser.add_argument("--lister", action="store_true", help="Lister les opérations disponibles")
     parser.add_argument("--sortie", default=".", help="Répertoire de sortie (défaut : .)")
-    parser.add_argument("--source", default=SOURCE_PAR_DEFAUT,
-                        help="Fichier Excel des factures, ou « database_sync » pour le cache")
+    parser.add_argument("--source", nargs="+", default=[SOURCE_PAR_DEFAUT],
+                        help="Exports SEDIT à charger : fichiers, motifs (data_sources/factures*.xls) "
+                             "ou répertoires. « database_sync » lit le cache existant.")
     parser.add_argument("--db", default=DB_PAR_DEFAUT, help="Base de suivi des commandes")
     parser.add_argument("--exercice", default=None, help="Filtrer sur un exercice (ex : 2024)")
+    parser.add_argument("--cache", default=None,
+                        help=f"Cache SQLite à utiliser (défaut : {CACHE_APPLICATION} en lecture "
+                             f"du cache existant, sinon {CACHE_REGENERATION})")
     args = parser.parse_args(argv)
 
     if args.lister:
-        for code_operation in lister_operations(construire_analyzer(args.source, args.db)):
+        analyzer = construire_analyzer(args.source, args.db, args.cache)
+        for code_operation in lister_operations(analyzer):
             print(code_operation)
         return 0
 
@@ -147,6 +168,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         source=args.source,
         db_path=args.db,
         exercice=args.exercice,
+        cache_path=args.cache,
     )
 
 
