@@ -108,6 +108,84 @@ class TestRequirementsAssouplies(unittest.TestCase):
         self.assertEqual(lignes, ['pandas>=2.1.4; python_version=="3.11"'])
 
 
+class TestDetectionDesChangements(unittest.TestCase):
+    """Un requirements.txt modifié doit relancer l'installation.
+
+    Vérifier que les modules s'importent ne suffit pas : une version relevée ou
+    une dépendance ajoutée qui se trouve déjà présente passerait inaperçue.
+    """
+
+    def setUp(self):
+        self.repertoire = Path(tempfile.mkdtemp())
+        self._requirements = lanceur.REQUIREMENTS
+        self._logs = lanceur.DOSSIER_LOGS
+        self._marqueur = lanceur.MARQUEUR
+        lanceur.REQUIREMENTS = self.repertoire / "requirements.txt"
+        lanceur.DOSSIER_LOGS = self.repertoire / "run_logs"
+        lanceur.MARQUEUR = lanceur.DOSSIER_LOGS / "requirements_installees.txt"
+        self.addCleanup(setattr, lanceur, "REQUIREMENTS", self._requirements)
+        self.addCleanup(setattr, lanceur, "DOSSIER_LOGS", self._logs)
+        self.addCleanup(setattr, lanceur, "MARQUEUR", self._marqueur)
+        self.addCleanup(shutil.rmtree, self.repertoire, True)
+
+        lanceur.REQUIREMENTS.write_text("pandas==2.1.4\n", encoding="utf-8")
+
+    def test_sans_marqueur_installation_requise(self):
+        self.assertTrue(lanceur.requirements_ont_change())
+
+    def test_apres_installation_plus_rien_a_faire(self):
+        lanceur._noter_installation()
+        self.assertFalse(lanceur.requirements_ont_change())
+
+    def test_dependance_ajoutee_detectee(self):
+        lanceur._noter_installation()
+        lanceur.REQUIREMENTS.write_text("pandas==2.1.4\nxlrd==2.0.2\n", encoding="utf-8")
+        self.assertTrue(lanceur.requirements_ont_change())
+
+    def test_version_relevee_detectee(self):
+        lanceur._noter_installation()
+        lanceur.REQUIREMENTS.write_text("pandas==2.2.3\n", encoding="utf-8")
+        self.assertTrue(lanceur.requirements_ont_change())
+
+    def test_fichier_absent_ne_declenche_rien(self):
+        lanceur.REQUIREMENTS.unlink()
+        self.assertFalse(lanceur.requirements_ont_change())
+
+    def test_marqueur_illisible_ne_bloque_pas(self):
+        # Un dossier en lecture seule ne doit pas empêcher le lancement.
+        lanceur.MARQUEUR = self.repertoire / "inexistant" / "sous-dossier" / "marqueur.txt"
+        lanceur._noter_installation()  # ne doit pas lever
+        self.assertTrue(lanceur.requirements_ont_change())
+
+    def test_installation_declenchee_par_le_seul_changement(self):
+        """Modules tous présents mais fichier modifié : on installe quand même."""
+        lanceur._noter_installation()
+        lanceur.REQUIREMENTS.write_text("pandas==2.2.3\n", encoding="utf-8")
+
+        appels = []
+        originaux = (lanceur.installer_dependances, lanceur.dependances_manquantes)
+        lanceur.installer_dependances = lambda: appels.append("install") or True
+        lanceur.dependances_manquantes = lambda: []
+        self.addCleanup(setattr, lanceur, "installer_dependances", originaux[0])
+        self.addCleanup(setattr, lanceur, "dependances_manquantes", originaux[1])
+
+        self.assertEqual(lanceur.main(["--verif"]), 0)
+        self.assertEqual(appels, ["install"])
+
+    def test_rien_a_installer_quand_tout_est_a_jour(self):
+        lanceur._noter_installation()
+
+        appels = []
+        originaux = (lanceur.installer_dependances, lanceur.dependances_manquantes)
+        lanceur.installer_dependances = lambda: appels.append("install") or True
+        lanceur.dependances_manquantes = lambda: []
+        self.addCleanup(setattr, lanceur, "installer_dependances", originaux[0])
+        self.addCleanup(setattr, lanceur, "dependances_manquantes", originaux[1])
+
+        self.assertEqual(lanceur.main(["--verif"]), 0)
+        self.assertEqual(appels, [])
+
+
 class TestVerificationSeule(unittest.TestCase):
 
     def test_verif_ne_lance_pas_l_application(self):

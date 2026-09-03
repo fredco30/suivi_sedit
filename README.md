@@ -13,6 +13,11 @@ Lancer_suivi_marches.cmd --maj      réinstalle les dépendances puis lance
 Lancer_suivi_marches.cmd --verif    vérifie seulement, ne lance rien
 ```
 
+L'installation se déclenche si un module manque **ou** si `requirements.txt` a
+changé depuis la dernière installation réussie — une version relevée ou une
+dépendance ajoutée qui se trouve déjà présente passerait sinon inaperçue. Une
+empreinte du fichier est notée dans `run_logs/requirements_installees.txt`.
+
 La logique est dans `lanceur.py` (utilisable seul : `python lanceur.py --verif`) ;
 le `.cmd` ne fait que trouver Python. Si `pip` refuse les versions figées de
 `requirements.txt` — `pandas==2.1.4` n'a pas de binaire au-delà de Python 3.12 —

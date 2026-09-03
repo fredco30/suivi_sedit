@@ -11,11 +11,16 @@ gere mal selon la page de code active.
     python lanceur.py             # verifie les dependances puis lance
     python lanceur.py --maj       # reinstalle les dependances, puis lance
     python lanceur.py --verif     # verifie seulement, ne lance rien
+
+L'installation se declenche si un module manque, ou si requirements.txt a change
+depuis la derniere installation reussie -- une version relevee ou une dependance
+ajoutee qui se trouve deja presente passerait sinon inapercue.
 """
 from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import os
 import subprocess
 import sys
@@ -25,6 +30,9 @@ from pathlib import Path
 RACINE = Path(__file__).resolve().parent
 REQUIREMENTS = RACINE / "requirements.txt"
 DOSSIER_LOGS = RACINE / "run_logs"
+# Empreinte du requirements.txt tel qu'installé la dernière fois : c'est elle
+# qui permet de repérer qu'il a changé alors que tout s'importe encore.
+MARQUEUR = DOSSIER_LOGS / "requirements_installees.txt"
 MOTIF_APPLICATION = "suivi_commandes_factures_marches_*.py"
 
 # Modules dont l'absence empêche l'application de démarrer, et le paquet pip
@@ -63,6 +71,33 @@ def trouver_application() -> Path:
         marque = "  <--" if chemin is candidats[0] else ""
         print(f"       {chemin.name}  ({horodatage:%d/%m/%Y %H:%M}){marque}")
     return candidats[0]
+
+
+def _empreinte_requirements() -> str:
+    return hashlib.sha256(REQUIREMENTS.read_bytes()).hexdigest()
+
+
+def requirements_ont_change() -> bool:
+    """Le fichier a-t-il changé depuis la dernière installation réussie ?
+
+    Vérifier que les modules s'importent ne suffit pas : une version relevée ou
+    une dépendance ajoutée qui se trouve déjà présente passerait inaperçue. On
+    compare donc l'empreinte du fichier à celle notée au dernier succès.
+    """
+    if not REQUIREMENTS.exists():
+        return False
+    if not MARQUEUR.exists():
+        return True
+    return MARQUEUR.read_text(encoding="utf-8").strip() != _empreinte_requirements()
+
+
+def _noter_installation() -> None:
+    """Retient l'empreinte du requirements.txt qui vient d'être installé."""
+    try:
+        MARQUEUR.parent.mkdir(exist_ok=True)
+        MARQUEUR.write_text(_empreinte_requirements() + "\n", encoding="utf-8")
+    except OSError:
+        pass  # Sans marqueur, on réinstallera au prochain lancement : sans gravité.
 
 
 def dependances_manquantes() -> list:
@@ -109,6 +144,7 @@ def installer_dependances() -> bool:
 
     afficher_titre("INSTALLATION DES DÉPENDANCES")
     if _pip("install", "-r", str(REQUIREMENTS)) == 0:
+        _noter_installation()
         return True
 
     print()
@@ -118,6 +154,7 @@ def installer_dependances() -> bool:
     print("       Nouvelle tentative en les traitant comme des versions minimales.")
 
     if _pip("install", "-r", str(_requirements_assouplies())) == 0:
+        _noter_installation()
         print()
         print("[OK] Installation réussie avec des versions plus récentes.")
         print("     Signalez-le : requirements.txt gagnerait à être mis à jour.")
@@ -196,7 +233,11 @@ def main(argv=None) -> int:
     else:
         print("Modules : tous présents")
 
-    if arguments.maj or manquantes:
+    change = requirements_ont_change()
+    if change:
+        print("Requis  : requirements.txt a changé depuis la dernière installation")
+
+    if arguments.maj or manquantes or change:
         if not installer_dependances():
             return 1
         encore = dependances_manquantes()
