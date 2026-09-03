@@ -24,6 +24,7 @@ from __future__ import annotations
 import glob
 import os
 import shutil
+import sqlite3
 import tempfile
 import unittest
 from collections import defaultdict
@@ -795,6 +796,134 @@ class TestResolutionSources(unittest.TestCase):
 
     def test_mot_cle_database_sync_ne_designe_aucun_fichier(self):
         self.assertEqual(self.resoudre("database_sync"), [])
+
+
+class TestEnveloppesMarches(unittest.TestCase):
+    """Saisie en lot des enveloppes contractuelles.
+
+    L'enveloppe d'un marche est son montant notifie : elle ne figure dans aucun
+    export SEDIT et ne s'en deduit pas. Le module ne devine donc rien -- il
+    produit un tableau a remplir et reinjecte la colonne saisie.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import openpyxl
+            import enveloppes_marches
+        except ImportError:
+            raise unittest.SkipTest("openpyxl indisponible")
+        cls.openpyxl = openpyxl
+        cls.module = enveloppes_marches
+
+    def setUp(self):
+        self.repertoire = tempfile.mkdtemp()
+        self.db = os.path.join(self.repertoire, "suivi.db")
+        conn = sqlite3.connect(self.db)
+        conn.execute("""
+            CREATE TABLE marches (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code_marche TEXT UNIQUE NOT NULL,
+                libelle TEXT, fournisseur TEXT, montant_initial_manuel REAL,
+                date_notification TEXT, date_debut TEXT, date_fin_prevue TEXT,
+                notes TEXT, last_update TEXT, type_marche TEXT DEFAULT 'CLASSIQUE'
+            )
+        """)
+        conn.execute(
+            "INSERT INTO marches (code_marche, montant_initial_manuel) VALUES ('DEJA_LA', 1000.0)"
+        )
+        conn.commit()
+        conn.close()
+
+    def tearDown(self):
+        shutil.rmtree(self.repertoire, ignore_errors=True)
+
+    def _tableau(self, lignes):
+        """Écrit un tableau au format attendu par l'importateur."""
+        chemin = os.path.join(self.repertoire, "enveloppes.xlsx")
+        wb = self.openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Enveloppes"
+        for col, entete in enumerate(self.module.EN_TETES, 1):
+            ws.cell(5, col, entete)
+        for idx, (code, montant) in enumerate(lignes, start=6):
+            ws.cell(idx, 1, code)
+            ws.cell(idx, 2, montant)
+        wb.save(chemin)
+        return chemin
+
+    def _montants(self):
+        conn = sqlite3.connect(self.db)
+        try:
+            return dict(conn.execute(
+                "SELECT code_marche, montant_initial_manuel FROM marches"
+            ))
+        finally:
+            conn.close()
+
+    def test_simulation_n_ecrit_rien(self):
+        fichier = self._tableau([("NOUVEAU", 5000.0)])
+        self.assertEqual(self.module.importer(fichier, self.db, appliquer=False), 0)
+        self.assertNotIn("NOUVEAU", self._montants())
+
+    def test_application_cree_et_modifie(self):
+        fichier = self._tableau([("NOUVEAU", 5000.0), ("DEJA_LA", 2500.0)])
+        self.assertEqual(self.module.importer(fichier, self.db, appliquer=True), 0)
+        montants = self._montants()
+        self.assertAlmostEqual(montants["NOUVEAU"], 5000.0, places=2)
+        self.assertAlmostEqual(montants["DEJA_LA"], 2500.0, places=2)
+
+    def test_lignes_sans_montant_ignorees(self):
+        fichier = self._tableau([("NOUVEAU", None), ("VIDE", ""), ("ZERO", 0)])
+        self.assertEqual(self.module.importer(fichier, self.db, appliquer=True), 0)
+        montants = self._montants()
+        self.assertEqual(set(montants), {"DEJA_LA"})
+
+    def test_montant_saisi_a_la_francaise(self):
+        fichier = self._tableau([("NOUVEAU", "12 345,67 €")])
+        self.assertEqual(self.module.importer(fichier, self.db, appliquer=True), 0)
+        self.assertAlmostEqual(self._montants()["NOUVEAU"], 12345.67, places=2)
+
+    def test_montant_illisible_refuse_sans_rien_ecrire(self):
+        fichier = self._tableau([("NOUVEAU", "à voir avec le service")])
+        self.assertEqual(self.module.importer(fichier, self.db, appliquer=True), 1)
+        self.assertNotIn("NOUVEAU", self._montants())
+
+    def test_colonnes_deplacees_toujours_reperees(self):
+        # Le fichier revient d'un tableur : ses colonnes ont pu bouger.
+        chemin = os.path.join(self.repertoire, "deplace.xlsx")
+        wb = self.openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Enveloppes"
+        ws.cell(3, 4, self.module.COLONNE_ENVELOPPE)
+        ws.cell(3, 7, self.module.COLONNE_MARCHE)
+        ws.cell(4, 7, "NOUVEAU")
+        ws.cell(4, 4, 7500.0)
+        wb.save(chemin)
+
+        self.assertEqual(self.module.importer(chemin, self.db, appliquer=True), 0)
+        self.assertAlmostEqual(self._montants()["NOUVEAU"], 7500.0, places=2)
+
+    def test_en_tetes_absents_signales(self):
+        chemin = os.path.join(self.repertoire, "vide.xlsx")
+        wb = self.openpyxl.Workbook()
+        wb.active.cell(1, 1, "rien à voir")
+        wb.save(chemin)
+        self.assertEqual(self.module.importer(chemin, self.db, appliquer=True), 1)
+
+    def test_enveloppe_saisie_reprise_par_l_export(self):
+        """Une fois saisie, l'enveloppe est reprise sans autre intervention."""
+        analyzer = _charger_analyzer()
+        if analyzer is None:
+            self.skipTest("données du dépôt indisponibles")
+
+        _, _, enveloppes, provenances, info = analyzer.collecter_ecritures_operation(MARCHE)
+        if info is None:
+            self.skipTest(f"opération {MARCHE} absente")
+
+        from marches_module import MarchesAnalyzer
+        self.assertEqual(set(provenances.values()), {MarchesAnalyzer.ENVELOPPE_BASE})
+        self.assertAlmostEqual(sum(enveloppes.values()), 4175726.00, places=2)
 
 
 if __name__ == "__main__":

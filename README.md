@@ -67,6 +67,29 @@ python regenerer_suivis.py --tout --source "data_sources/factures*.xls" --sortie
 python regenerer_suivis.py --lister
 ```
 
+### Enveloppes contractuelles des marchés
+
+Le solde d'un marché se calcule contre son **enveloppe notifiée**, qui figure
+dans l'acte d'engagement et dans aucun export SEDIT. Les montants SEDIT sont
+ceux *engagés à ce jour* : sur les trois marchés où les deux valeurs sont
+connues, l'écart va de 1,06 à 115 fois. Ils ne sont donc pas une approximation
+utilisable, et le programme ne les recopie jamais en base.
+
+La saisie se fait en une passe :
+
+```bash
+python enveloppes_marches.py exporter --source "data_sources/factures*.xls"
+#  ... remplir la colonne « ENVELOPPE CONTRACTUELLE TTC » ...
+python enveloppes_marches.py importer enveloppes_a_saisir.xlsx            # simulation
+python enveloppes_marches.py importer enveloppes_a_saisir.xlsx --appliquer
+python regenerer_suivis.py --tout --source "data_sources/factures*.xls" --sortie exports
+```
+
+Le tableau produit liste chaque marché avec son fournisseur, ses opérations, son
+engagé et son facturé à ce jour — des repères pour la saisie, jamais l'enveloppe.
+L'import est une simulation par défaut ; il repère ses colonnes par leur en-tête,
+accepte les montants au format français et n'écrit rien si l'un est illisible.
+
 ### Tests
 
 ```bash
