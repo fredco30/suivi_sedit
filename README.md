@@ -37,6 +37,29 @@ Pour chaque BDC : `montant_ref = max(montant_bdc_déclaré, Σ factures mandaté
 et `reliquat = montant_ref - Σ factures`. Un BDC soldé n'a donc pas de ligne
 d'engagement, et un report d'exercice ne crée pas de second engagement.
 
+SEDIT tronque les libellés à largeur fixe : le marqueur `(REPORT)` en revient
+souvent amputé (`georeferencement obligatoire(REP`). Ces débuts de marqueur sont
+retirés en fin de libellé — une parenthèse ouverte n'y apporte rien —, mais une
+parenthèse ouverte par une troncature ordinaire est conservée. Les n° de mandat,
+que SEDIT remonte comme des nombres, s'écrivent « 1470 » et non « 1470.0 ».
+
+### Un bloc par lot
+
+Le tableau est découpé en **un bloc par marché**, c'est-à-dire par lot : le
+marché est l'unité qui porte une enveloppe notifiée, donc la seule contre
+laquelle un solde ait un sens. Chaque bloc a son sous-total et son propre
+« restant ». Le prestataire et la tranche sont des attributs de l'**écriture**,
+pas du bloc — un marché peut être tenu par un groupement d'entreprises et
+couvrir plusieurs tranches ; les lire sur la première ligne du marché
+réattribuait au mandataire les lignes de ses cotraitants, et faisait dépendre
+le résultat de l'ordre de lecture des exports SEDIT.
+
+L'enveloppe d'un lot est lue en base (montant initial, tranches optionnelles et
+avenants) ; à défaut, elle est reconstituée depuis SEDIT **toutes tranches
+additionnées**. C'est le calcul de l'onglet *Opérations*, si bien que l'export
+et le tableau à l'écran ne peuvent plus afficher deux montants différents —
+n'en retenir qu'une tranche sous-évaluait 5 opérations de 767 935,72 €.
+
 Le classeur produit quatre onglets : `FINANCIER`, `A jour` (une ligne par BDC,
 issue du même jeu de données), `Anomalies` (montants de BDC à arbitrer) et
 `Lignes neutralisées` (trace des engagements supprimés ou ramenés au reliquat).
@@ -121,8 +144,40 @@ Deux boutons couvrent le même besoin sans passer par la ligne de commande :
   colonnes « engagé » et « facturé » ne sont que des repères. Le tableau
   s'exporte et se réimporte en `.xlsx` pour une saisie hors application, et rien
   n'est écrit tant que « Enregistrer » n'est pas cliqué.
-- **🔁 Tout régénérer** (onglet *Opérations*) régénère toutes les opérations dans
-  un dossier au choix, avec barre de progression et annulation.
+- **📊 Exporter le suivi financier** (onglet *Opérations*) ouvre un seul écran
+  pour tout l'export : la portée — la sélection du tableau (Ctrl/Maj pour en
+  prendre plusieurs), les opérations que le filtre laisse voir, ou toutes —,
+  l'exercice, le tri par n° de bon de commande et le journal de contrôle. Une
+  seule opération demande un nom de fichier, plusieurs demandent un dossier,
+  avec barre de progression et annulation.
+
+  Ce bouton en remplace trois : « Exporter suivi financier » (une opération,
+  sans choix d'exercice), « Export 2020_14G3P » (une opération **écrite en
+  dur**, seule à donner accès au choix d'exercice, au tri par BDC et au
+  journal) et « Tout régénérer » (toutes les opérations, sans aucune option, et
+  sans tenir compte du filtre affiché). Cocher les deux options de présentation
+  rend exactement le tableau que produisait le bouton en dur — un test le
+  vérifie feuille contre feuille.
+
+### Onglet Opérations
+
+Une colonne **Enveloppe** dit ce que vaut le « Montant initial total » de la
+ligne : `✓ notifiée` (lue en base), `≈ reconstituée` (somme des engagements
+SEDIT, à saisir en base) ou `⚠ non saisie`. Il fallait auparavant ouvrir le
+fichier exporté pour l'apprendre. Le tableau et l'export passent par la même
+fonction, `_enveloppe_marche` : la colonne annonce ce que dira le fichier.
+Trier la colonne classe par fiabilité, non par ordre alphabétique — c'est ce
+qui rassemble les enveloppes restant à saisir. Une opération sans enveloppe
+apparaît en gris : son pourcentage consommé vaut 0, et elle passait au vert
+« peu consommé » alors que rien n'est calculé.
+
+Le champ de recherche du bandeau porte sur le **code opération, les codes de
+lot, le libellé et le titulaire** — il ne connaissait que le code opération,
+alors que le tableau affiche les trois autres. Chercher un code de lot trouve
+l'opération qui le porte.
+
+La colonne **Fournisseur** liste tous les titulaires, cotraitants compris : un
+marché tenu par un groupement n'affichait que son mandataire.
 
 ### Filtres (Commandes, Rappels, Factures, Facturation)
 
@@ -155,6 +210,16 @@ qu'appelée pendant la construction de la fenêtre.
 L'interface est testée sans affichage (`QT_QPA_PLATFORM=offscreen`) ;
 `test_interface.py` et `test_filtres_ui.py` sont ignorés si PyQt5 n'est pas
 installé.
+
+Les cinq suites tournent à chaque poussée et sur chaque pull request
+(`.github/workflows/tests.yml`), sur Python 3.11 — la version pour laquelle
+`pandas==2.1.4` a un binaire. Les exports SEDIT et la base étant versionnés,
+les tests qui s'appuient dessus s'exécutent pour de bon au lieu d'être ignorés,
+et le job le vérifie avant de lancer quoi que ce soit.
+
+```bash
+python -m unittest discover -p 'test_*.py'   # les 193 d'un coup
+```
 
 
 ```bash

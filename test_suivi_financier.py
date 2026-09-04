@@ -87,6 +87,21 @@ class TestNettoyageDesignation(unittest.TestCase):
         self.assertEqual(nettoyer_designation(None), "")
         self.assertEqual(nettoyer_designation(""), "")
 
+    def test_marqueur_report_tronque_par_sedit(self):
+        # SEDIT coupe le libelle a largeur fixe : le marqueur arrive ampute.
+        for fragment in ("(REPORT", "(REPOR", "(REPO", "(REP"):
+            self.assertEqual(
+                nettoyer_designation("georeferencement obligatoire" + fragment),
+                "georeferencement obligatoire",
+                fragment,
+            )
+
+    def test_parenthese_legitime_conservee(self):
+        # Une parenthese ouverte par une troncature ordinaire n'est pas un
+        # marqueur de report : elle reste, faute de quoi on amputerait le texte.
+        libelle = "G3P - CABLE HS Oree du Golf (allee de l'"
+        self.assertEqual(nettoyer_designation(libelle), libelle)
+
 
 class TestReglesAgregation(unittest.TestCase):
     """Regle : une ligne par etat de BDC, pas une ligne par ecriture SEDIT."""
@@ -447,10 +462,25 @@ class TestExportOperation(unittest.TestCase):
         self.assertAlmostEqual(impute, sum(distincts.values()), places=2)
 
     def test_aucun_suffixe_report_dans_les_designations(self):
-        # §2.3 : le suffixe est remplace par la colonne STATUT.
+        # §2.3 : le suffixe est remplace par la colonne STATUT, y compris
+        # lorsque SEDIT ne l'a remonte qu'ampute (« ...obligatoire(REP »).
         for row in range(6, self.ws.max_row + 1):
             designation = self.ws.cell(row, 2).value or ""
             self.assertNotIn("REPORT)", designation)
+            for fragment in ("(REPORT", "(REPOR", "(REPO", "(REP"):
+                self.assertFalse(designation.endswith(fragment), designation)
+
+    def test_numeros_de_mandat_sans_decimale(self):
+        # SEDIT remonte les mandats comme des nombres : « 1470.0 » n'est pas
+        # un n° de mandat, le mandat s'appelle « 1470 ».
+        mandats = [
+            str(self.ws.cell(row, 8).value)
+            for row in range(6, self.ws.max_row)
+            if self.ws.cell(row, 8).value
+        ]
+        self.assertTrue(mandats, "aucun mandat dans l'export de reference")
+        for mandat in mandats:
+            self.assertFalse(mandat.endswith(".0"), mandat)
 
 
 class TestResolutionNumeroBdc(unittest.TestCase):
@@ -924,6 +954,277 @@ class TestEnveloppesMarches(unittest.TestCase):
         from marches_module import MarchesAnalyzer
         self.assertEqual(set(provenances.values()), {MarchesAnalyzer.ENVELOPPE_BASE})
         self.assertAlmostEqual(sum(enveloppes.values()), 4175726.00, places=2)
+
+
+class TestGroupementParLot(unittest.TestCase):
+    """Un bloc par marche : le lot est l'unite qui porte une enveloppe."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.analyzer = _charger_analyzer()
+        if cls.analyzer is None:
+            raise unittest.SkipTest("données du dépôt indisponibles")
+        cls.operations = cls.analyzer.get_vision_operations()
+
+    def test_un_groupe_par_marche_de_l_operation(self):
+        for operation in self.operations:
+            groupes, _, _, _, info = self.analyzer.collecter_ecritures_operation(
+                operation["operation"]
+            )
+            if info is None:
+                continue
+            colonne = self.analyzer.df_marches.iloc[:, self.analyzer.COL_MARCHE]
+            avec_ecritures = {m for m in operation["marches"] if (colonne == m).any()}
+            self.assertEqual(set(groupes), avec_ecritures, operation["operation"])
+
+    def test_enveloppe_identique_a_l_onglet_operations(self):
+        """L'export et l'onglet Opérations ne peuvent plus afficher deux montants.
+
+        Les deux lisent l'enveloppe du marché — base si elle y est, sinon la
+        somme SEDIT de *toutes* ses tranches. Retenir la seule tranche de la
+        première ligne sous-évaluait 5 opérations de 767 935,72 € au total.
+        """
+        for operation in self.operations:
+            _, _, enveloppes, _, info = self.analyzer.collecter_ecritures_operation(
+                operation["operation"]
+            )
+            if info is None:
+                continue
+            self.assertAlmostEqual(
+                sum(enveloppes.values()),
+                operation["montant_initial_total"],
+                places=2,
+                msg=operation["operation"],
+            )
+
+    def test_provenance_identique_a_l_onglet_operations(self):
+        """La colonne « Enveloppe » du tableau annonce ce que dira l'export.
+
+        L'une et l'autre passent par `_enveloppe_marche` : le tableau ne peut
+        pas afficher « notifiée » là où le fichier écrira « reconstituée ».
+        """
+        for operation in self.operations:
+            _, _, _, provenances, info = self.analyzer.collecter_ecritures_operation(
+                operation["operation"]
+            )
+            if info is None or not provenances:
+                continue
+            pire = max(
+                provenances.values(), key=lambda p: self.analyzer.RANG_PROVENANCE[p]
+            )
+            self.assertEqual(
+                operation["provenance_enveloppe"], pire, operation["operation"]
+            )
+
+    def test_prestataire_lu_sur_l_ecriture(self):
+        """Un marche tenu par un groupement garde ses cotraitants.
+
+        Le prestataire etait lu sur la premiere ligne du marche et recopie sur
+        toutes les autres, ce qui reattribuait au mandataire les lignes de ses
+        cotraitants — et dependait de l'ordre de lecture des exports SEDIT.
+        """
+        import pandas as pd
+
+        analyzer = self.analyzer
+        colonne_marche = analyzer.df_marches.iloc[:, analyzer.COL_MARCHE]
+        colonne_fournisseur = analyzer.df_marches.iloc[:, analyzer.COL_FOURNISSEUR]
+
+        controle = 0
+        for operation in self.operations:
+            groupes, _, _, _, info = analyzer.collecter_ecritures_operation(
+                operation["operation"]
+            )
+            if info is None:
+                continue
+            for marche, ecritures in groupes.items():
+                attendus = {
+                    "" if pd.isna(v) else str(v).strip()
+                    for v in colonne_fournisseur[colonne_marche == marche]
+                }
+                obtenus = {e.fournisseur for e in ecritures}
+                self.assertTrue(obtenus <= attendus, f"{marche} : {obtenus - attendus}")
+                if len(attendus) > 1:
+                    controle += 1
+                    self.assertEqual(obtenus, attendus, marche)
+
+        self.assertGreater(controle, 0, "aucun marché à plusieurs prestataires")
+
+    def test_lots_d_un_meme_titulaire_gardent_chacun_leur_sous_total(self):
+        """Bout en bout : deux lots du meme titulaire font deux blocs, pas un.
+
+        Regroupes sur (fournisseur, tranche), ils n'en formaient qu'un, avec un
+        sous-total et une enveloppe additionnes — le solde de chaque lot, qui
+        est un marche notifie pour son propre montant, etait alors introuvable.
+        """
+        import pandas as pd
+
+        analyzer = self.analyzer
+        colonne_marche = analyzer.df_marches.iloc[:, analyzer.COL_MARCHE]
+        colonne_fournisseur = analyzer.df_marches.iloc[:, analyzer.COL_FOURNISSEUR]
+
+        def _titulaires(marche):
+            return {
+                "" if pd.isna(v) else str(v).strip()
+                for v in colonne_fournisseur[colonne_marche == marche]
+            }
+
+        cible = None
+        for operation in self.operations:
+            lots = [m for m in operation["marches"] if (colonne_marche == m).any()]
+            if len(lots) < 2:
+                continue
+            for rang, lot in enumerate(lots):
+                if any(_titulaires(lot) & _titulaires(autre) for autre in lots[rang + 1:]):
+                    cible = (operation["operation"], lots)
+                    break
+            if cible:
+                break
+
+        if cible is None:
+            self.skipTest("aucune opération dont deux lots partagent un titulaire")
+
+        code_operation, lots = cible
+        import openpyxl
+
+        with tempfile.TemporaryDirectory() as repertoire:
+            chemin = os.path.join(repertoire, "suivi.xlsx")
+            self.assertTrue(analyzer.export_suivi_financier_operation(
+                code_operation, chemin, exercice_filter=None, special_export=False
+            ))
+            feuille = openpyxl.load_workbook(chemin)["FINANCIER"]
+            sous_totaux = [
+                feuille.cell(row, 2).value
+                for row in range(6, feuille.max_row + 1)
+                if feuille.cell(row, 15).value == "TOTAL"
+            ]
+
+        self.assertEqual(len(sous_totaux), len(lots), sous_totaux)
+        for lot in lots:
+            self.assertTrue(
+                any(f"marché {lot}" in (libelle or "") for libelle in sous_totaux),
+                f"{lot} absent des sous-totaux : {sous_totaux}",
+            )
+
+
+class TestOptionsExport(unittest.TestCase):
+    """Le tri et le journal se choisissent separement, sans changer le resultat."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.analyzer = _charger_analyzer()
+        if cls.analyzer is None:
+            raise unittest.SkipTest("données du dépôt indisponibles")
+
+    def _feuille(self, **options):
+        import openpyxl
+
+        with tempfile.TemporaryDirectory() as repertoire:
+            chemin = os.path.join(repertoire, "suivi.xlsx")
+            options.setdefault("exercice_filter", None)
+            self.assertTrue(self.analyzer.export_suivi_financier_operation(
+                MARCHE, chemin, **options
+            ))
+            feuille = openpyxl.load_workbook(chemin)["FINANCIER"]
+            return [
+                tuple(feuille.cell(ligne, colonne).value for colonne in range(1, 16))
+                for ligne in range(6, feuille.max_row + 1)
+            ]
+
+    def test_les_deux_options_reproduisent_l_ancien_export_special(self):
+        """Le bouton en dur ne faisait rien d'autre que cocher ces deux cases.
+
+        Il etait le seul chemin vers le tri par BDC et le journal de controle ;
+        la fenetre de choix les offre pour n'importe quelle operation, et doit
+        rendre exactement le meme tableau.
+        """
+        self.assertEqual(
+            self._feuille(trier_par_bdc=True, journal=True),
+            self._feuille(special_export=True),
+        )
+
+    def test_le_tri_par_bdc_ordonne_les_lignes(self):
+        bdc_tries = [ligne[4] for ligne in self._feuille(trier_par_bdc=True) if ligne[14] != "TOTAL"]
+        self.assertEqual(bdc_tries, sorted(bdc_tries))
+
+    def test_le_journal_est_ecrit_a_part_du_tri(self):
+        import shutil
+
+        journal = os.path.join("run_logs", f"export_{MARCHE}.log")
+        sauvegarde = journal + ".test"
+        existait = os.path.exists(journal)
+        if existait:
+            shutil.copy2(journal, sauvegarde)
+        try:
+            if existait:
+                os.remove(journal)
+            self._feuille(trier_par_bdc=True, journal=False)
+            self.assertFalse(os.path.exists(journal))
+
+            self._feuille(trier_par_bdc=False, journal=True)
+            self.assertTrue(os.path.exists(journal))
+        finally:
+            if existait:
+                shutil.move(sauvegarde, journal)
+            elif os.path.exists(journal):
+                os.remove(journal)
+
+    def test_exercices_disponibles_couvre_tout_le_jeu(self):
+        globaux = self.analyzer.exercices_disponibles()
+        self.assertEqual(globaux[0], "Tous")
+        self.assertGreater(len(globaux), 1)
+
+        # La liste d'une operation est incluse dans la liste globale.
+        pour_operation = self.analyzer.get_exercices_for_operation(MARCHE)
+        self.assertEqual(pour_operation[0], "Tous")
+        self.assertTrue(set(pour_operation) <= set(globaux))
+
+    def test_exercice_filtre_reduit_le_tableau(self):
+        exercices = [e for e in self.analyzer.get_exercices_for_operation(MARCHE) if e != "Tous"]
+        self.assertTrue(exercices, "aucun exercice sur l'opération de référence")
+
+        complet = self._feuille()
+        partiel = self._feuille(exercice_filter=exercices[0])
+        self.assertLess(len(partiel), len(complet))
+
+
+class TestLibelleSousTotal(unittest.TestCase):
+    """L'intitule du sous-total n'enonce que ce que le bloc contient."""
+
+    @staticmethod
+    def _resultat(paires):
+        from suivi_financier_agg import LigneSuivi, ResultatSuivi
+
+        resultat = ResultatSuivi()
+        resultat.lignes = [
+            LigneSuivi(tranche_libelle=tranche, fournisseur=fournisseur)
+            for tranche, fournisseur in paires
+        ]
+        return resultat
+
+    def _libelle(self, marche, paires):
+        from marches_module import MarchesAnalyzer
+
+        return MarchesAnalyzer._libelle_sous_total(marche, self._resultat(paires))
+
+    def test_marche_mono_tranche_mono_prestataire(self):
+        self.assertEqual(
+            self._libelle("2020_11_1", [("TF", "WURTH FRANCE")] * 3),
+            "Sous-total marché 2020_11_1 — TF — WURTH FRANCE",
+        )
+
+    def test_tranches_dans_l_ordre_du_contrat(self):
+        libelle = self._libelle("2024_1_5", [("TO2", "X"), ("TO3", "X"), ("TF", "X")])
+        self.assertIn("TF, TO2, TO3", libelle)
+
+    def test_groupement_au_dela_de_trois_titulaires(self):
+        paires = [(f"TF", f"E{n}") for n in range(4)]
+        self.assertTrue(self._libelle("M", paires).endswith("4 prestataires"))
+
+    def test_tranche_absente_omise(self):
+        self.assertEqual(
+            self._libelle("MC146_1", [("", "DISPANO")]),
+            "Sous-total marché MC146_1 — DISPANO",
+        )
 
 
 if __name__ == "__main__":
