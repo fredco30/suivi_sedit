@@ -956,5 +956,176 @@ class TestEnveloppesMarches(unittest.TestCase):
         self.assertAlmostEqual(sum(enveloppes.values()), 4175726.00, places=2)
 
 
+class TestGroupementParLot(unittest.TestCase):
+    """Un bloc par marche : le lot est l'unite qui porte une enveloppe."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.analyzer = _charger_analyzer()
+        if cls.analyzer is None:
+            raise unittest.SkipTest("données du dépôt indisponibles")
+        cls.operations = cls.analyzer.get_vision_operations()
+
+    def test_un_groupe_par_marche_de_l_operation(self):
+        for operation in self.operations:
+            groupes, _, _, _, info = self.analyzer.collecter_ecritures_operation(
+                operation["operation"]
+            )
+            if info is None:
+                continue
+            colonne = self.analyzer.df_marches.iloc[:, self.analyzer.COL_MARCHE]
+            avec_ecritures = {m for m in operation["marches"] if (colonne == m).any()}
+            self.assertEqual(set(groupes), avec_ecritures, operation["operation"])
+
+    def test_enveloppe_identique_a_l_onglet_operations(self):
+        """L'export et l'onglet Opérations ne peuvent plus afficher deux montants.
+
+        Les deux lisent l'enveloppe du marché — base si elle y est, sinon la
+        somme SEDIT de *toutes* ses tranches. Retenir la seule tranche de la
+        première ligne sous-évaluait 5 opérations de 767 935,72 € au total.
+        """
+        for operation in self.operations:
+            _, _, enveloppes, _, info = self.analyzer.collecter_ecritures_operation(
+                operation["operation"]
+            )
+            if info is None:
+                continue
+            self.assertAlmostEqual(
+                sum(enveloppes.values()),
+                operation["montant_initial_total"],
+                places=2,
+                msg=operation["operation"],
+            )
+
+    def test_prestataire_lu_sur_l_ecriture(self):
+        """Un marche tenu par un groupement garde ses cotraitants.
+
+        Le prestataire etait lu sur la premiere ligne du marche et recopie sur
+        toutes les autres, ce qui reattribuait au mandataire les lignes de ses
+        cotraitants — et dependait de l'ordre de lecture des exports SEDIT.
+        """
+        import pandas as pd
+
+        analyzer = self.analyzer
+        colonne_marche = analyzer.df_marches.iloc[:, analyzer.COL_MARCHE]
+        colonne_fournisseur = analyzer.df_marches.iloc[:, analyzer.COL_FOURNISSEUR]
+
+        controle = 0
+        for operation in self.operations:
+            groupes, _, _, _, info = analyzer.collecter_ecritures_operation(
+                operation["operation"]
+            )
+            if info is None:
+                continue
+            for marche, ecritures in groupes.items():
+                attendus = {
+                    "" if pd.isna(v) else str(v).strip()
+                    for v in colonne_fournisseur[colonne_marche == marche]
+                }
+                obtenus = {e.fournisseur for e in ecritures}
+                self.assertTrue(obtenus <= attendus, f"{marche} : {obtenus - attendus}")
+                if len(attendus) > 1:
+                    controle += 1
+                    self.assertEqual(obtenus, attendus, marche)
+
+        self.assertGreater(controle, 0, "aucun marché à plusieurs prestataires")
+
+    def test_lots_d_un_meme_titulaire_gardent_chacun_leur_sous_total(self):
+        """Bout en bout : deux lots du meme titulaire font deux blocs, pas un.
+
+        Regroupes sur (fournisseur, tranche), ils n'en formaient qu'un, avec un
+        sous-total et une enveloppe additionnes — le solde de chaque lot, qui
+        est un marche notifie pour son propre montant, etait alors introuvable.
+        """
+        import pandas as pd
+
+        analyzer = self.analyzer
+        colonne_marche = analyzer.df_marches.iloc[:, analyzer.COL_MARCHE]
+        colonne_fournisseur = analyzer.df_marches.iloc[:, analyzer.COL_FOURNISSEUR]
+
+        def _titulaires(marche):
+            return {
+                "" if pd.isna(v) else str(v).strip()
+                for v in colonne_fournisseur[colonne_marche == marche]
+            }
+
+        cible = None
+        for operation in self.operations:
+            lots = [m for m in operation["marches"] if (colonne_marche == m).any()]
+            if len(lots) < 2:
+                continue
+            for rang, lot in enumerate(lots):
+                if any(_titulaires(lot) & _titulaires(autre) for autre in lots[rang + 1:]):
+                    cible = (operation["operation"], lots)
+                    break
+            if cible:
+                break
+
+        if cible is None:
+            self.skipTest("aucune opération dont deux lots partagent un titulaire")
+
+        code_operation, lots = cible
+        import openpyxl
+
+        with tempfile.TemporaryDirectory() as repertoire:
+            chemin = os.path.join(repertoire, "suivi.xlsx")
+            self.assertTrue(analyzer.export_suivi_financier_operation(
+                code_operation, chemin, exercice_filter=None, special_export=False
+            ))
+            feuille = openpyxl.load_workbook(chemin)["FINANCIER"]
+            sous_totaux = [
+                feuille.cell(row, 2).value
+                for row in range(6, feuille.max_row + 1)
+                if feuille.cell(row, 15).value == "TOTAL"
+            ]
+
+        self.assertEqual(len(sous_totaux), len(lots), sous_totaux)
+        for lot in lots:
+            self.assertTrue(
+                any(f"marché {lot}" in (libelle or "") for libelle in sous_totaux),
+                f"{lot} absent des sous-totaux : {sous_totaux}",
+            )
+
+
+class TestLibelleSousTotal(unittest.TestCase):
+    """L'intitule du sous-total n'enonce que ce que le bloc contient."""
+
+    @staticmethod
+    def _resultat(paires):
+        from suivi_financier_agg import LigneSuivi, ResultatSuivi
+
+        resultat = ResultatSuivi()
+        resultat.lignes = [
+            LigneSuivi(tranche_libelle=tranche, fournisseur=fournisseur)
+            for tranche, fournisseur in paires
+        ]
+        return resultat
+
+    def _libelle(self, marche, paires):
+        from marches_module import MarchesAnalyzer
+
+        return MarchesAnalyzer._libelle_sous_total(marche, self._resultat(paires))
+
+    def test_marche_mono_tranche_mono_prestataire(self):
+        self.assertEqual(
+            self._libelle("2020_11_1", [("TF", "WURTH FRANCE")] * 3),
+            "Sous-total marché 2020_11_1 — TF — WURTH FRANCE",
+        )
+
+    def test_tranches_dans_l_ordre_du_contrat(self):
+        libelle = self._libelle("2024_1_5", [("TO2", "X"), ("TO3", "X"), ("TF", "X")])
+        self.assertIn("TF, TO2, TO3", libelle)
+
+    def test_groupement_au_dela_de_trois_titulaires(self):
+        paires = [(f"TF", f"E{n}") for n in range(4)]
+        self.assertTrue(self._libelle("M", paires).endswith("4 prestataires"))
+
+    def test_tranche_absente_omise(self):
+        self.assertEqual(
+            self._libelle("MC146_1", [("", "DISPANO")]),
+            "Sous-total marché MC146_1 — DISPANO",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

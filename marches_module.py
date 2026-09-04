@@ -1173,43 +1173,99 @@ class MarchesAnalyzer:
             print(f"Erreur lors de l'export Excel : {e}")
             return False
 
-    def _enveloppe_tranche(self, marche: str, tranche_libelle: str,
-                           montant_tranche: float,
-                           marches_totaux: Dict[str, float]) -> Tuple[float, str]:
-        """Enveloppe initiale d'un couple (marché, tranche), et sa provenance.
+    @staticmethod
+    def libelle_tranche(tranche) -> str:
+        """Libellé d'une tranche SEDIT : TF pour la tranche ferme, TO1, TO2…"""
+        if pd.isna(tranche):
+            return ""
+        try:
+            numero = int(float(tranche))
+        except (TypeError, ValueError):
+            return str(tranche)
+        return "TF" if numero == 0 else f"TO{numero}"
 
-        L'enveloppe est un paramètre : elle est lue en base (montant initial du
-        marché, tranches et avenants) et jamais reconstituée depuis les lignes
-        du fichier produit. Quand le marché n'est pas renseigné en base, on
-        retombe sur les montants initiaux de l'export SEDIT — la provenance est
-        alors signalée en clair dans l'en-tête, car le montant reste à saisir.
+    def _enveloppe_marche(self, marche: str, montant_sedit: float,
+                          marches_totaux: Dict[str, float]) -> Tuple[float, str]:
+        """Enveloppe initiale d'un marché — donc d'un lot —, et sa provenance.
+
+        L'unité qui porte une enveloppe est le marché : un lot est un marché à
+        part entière, notifié pour son propre montant. L'enveloppe est lue en
+        base (montant initial, tranches optionnelles et avenants) et jamais
+        reconstituée depuis les lignes du fichier produit. À défaut de saisie en
+        base, on retombe sur les montants initiaux de l'export SEDIT, **toutes
+        tranches additionnées** — n'en retenir qu'une soldait un marché
+        pluri-tranches contre une fraction de son enveloppe.
+
+        Le calcul est celui de `get_vision_globale`, pour que l'enveloppe de
+        l'export et le « Montant initial total » de l'onglet Opérations ne
+        puissent pas diverger.
 
         Args:
-            montant_tranche: montant initial de la tranche, déjà calculé.
+            montant_sedit: reconstitution SEDIT, somme des tranches du marché.
 
         Returns:
             (montant, provenance) où provenance vaut ENVELOPPE_BASE,
             ENVELOPPE_SEDIT ou ENVELOPPE_ABSENTE.
         """
         montant_marche = float(marches_totaux.get(marche, 0) or 0)
-        configure_en_base = montant_marche > 0
-
-        if tranche_libelle and montant_tranche > 0:
-            return montant_tranche, (
-                self.ENVELOPPE_BASE if configure_en_base else self.ENVELOPPE_SEDIT
-            )
-        if configure_en_base:
+        if montant_marche > 0:
             return montant_marche, self.ENVELOPPE_BASE
-        if montant_tranche > 0:
-            return montant_tranche, self.ENVELOPPE_SEDIT
+        if montant_sedit > 0:
+            return montant_sedit, self.ENVELOPPE_SEDIT
         return 0.0, self.ENVELOPPE_ABSENTE
+
+    @staticmethod
+    def _libelle_sous_total(marche: str, resultat: ResultatSuivi) -> str:
+        """Intitulé du sous-total d'un lot : le marché, ses tranches, ses titulaires.
+
+        L'intitulé nommait auparavant une tranche et un prestataire uniques,
+        alors qu'un marché peut en porter plusieurs : il affirmait donc parfois
+        le faux. Il n'énonce plus que ce que le bloc contient réellement.
+        """
+        def _distincts(valeurs) -> List[str]:
+            vus: List[str] = []
+            for valeur in valeurs:
+                if valeur and valeur not in vus:
+                    vus.append(valeur)
+            return vus
+
+        elements = [f"Sous-total marché {marche}"]
+
+        def _rang_tranche(libelle: str) -> Tuple[int, str]:
+            """TF d'abord, puis TO1, TO2… — l'ordre du contrat, pas du fichier."""
+            if libelle == "TF":
+                return (0, "")
+            if libelle.startswith("TO") and libelle[2:].isdigit():
+                return (int(libelle[2:]), "")
+            return (10 ** 6, libelle)
+
+        tranches = sorted(
+            _distincts(ligne.tranche_libelle for ligne in resultat.lignes),
+            key=_rang_tranche,
+        )
+        if tranches:
+            elements.append(", ".join(tranches))
+
+        fournisseurs = _distincts(ligne.fournisseur for ligne in resultat.lignes)
+        if len(fournisseurs) > 3:
+            elements.append(f"{len(fournisseurs)} prestataires")
+        elif fournisseurs:
+            elements.append(" / ".join(fournisseurs))
+
+        return " — ".join(elements)
 
     def collecter_ecritures_operation(
         self,
         code_operation: str,
         exercice_filter: Optional[str] = None
     ) -> Tuple[Dict, Dict, Dict, Dict, Optional[Dict]]:
-        """Collecte les écritures SEDIT d'une opération, groupées par prestataire/tranche.
+        """Collecte les écritures SEDIT d'une opération, groupées par marché.
+
+        Un groupe est un **lot** : le marché est l'unité qui porte une
+        enveloppe notifiée, donc la seule contre laquelle un solde ait un sens.
+        Le prestataire et la tranche sont des attributs de l'écriture, pas du
+        groupe — un marché peut être tenu par un groupement d'entreprises et
+        couvrir plusieurs tranches.
 
         Source unique des onglets FINANCIER et « A jour » : les deux vues sont
         produites à partir de ce même jeu de données, jamais de deux requêtes
@@ -1217,8 +1273,8 @@ class MarchesAnalyzer:
 
         Returns:
             (groupes, montants_declares, enveloppes, provenances, operation_info)
-            où `groupes` associe (fournisseur, tranche_libelle) à une liste
-            d'`Ecriture` et `provenances` la source de chaque enveloppe.
+            où `groupes` associe un code marché à une liste d'`Ecriture`, et
+            `provenances` la source de l'enveloppe de chaque marché.
         """
         from collections import OrderedDict
 
@@ -1266,10 +1322,9 @@ class MarchesAnalyzer:
             for marche in marches_operation:
                 marches_totaux[marche] = self.db.get_montant_total_marche(marche)
 
-        groupes: "OrderedDict[Tuple[str, str], List[Ecriture]]" = OrderedDict()
-        enveloppes: Dict[Tuple[str, str], float] = {}
-        provenances: Dict[Tuple[str, str], str] = {}
-        marches_vus: Dict[Tuple[str, str], set] = {}
+        groupes: "OrderedDict[str, List[Ecriture]]" = OrderedDict()
+        enveloppes: Dict[str, float] = {}
+        provenances: Dict[str, str] = {}
 
         def _texte(row, col) -> str:
             valeur = row.iloc[col]
@@ -1307,36 +1362,23 @@ class MarchesAnalyzer:
             if len(df_marche) == 0:
                 continue
 
-            fournisseur = df_marche.iloc[0, self.COL_FOURNISSEUR]
-            fournisseur = "" if pd.isna(fournisseur) else str(fournisseur)
-            tranche = df_marche.iloc[0, self.COL_TRANCHE]
+            groupes.setdefault(marche, [])
 
-            tranche_libelle = ""
-            if pd.notna(tranche):
-                try:
-                    tranche_num = int(float(tranche))
-                    tranche_libelle = "TF" if tranche_num == 0 else f"TO{tranche_num}"
-                except (TypeError, ValueError):
-                    tranche_libelle = str(tranche)
-
-            cle_groupe = (fournisseur, tranche_libelle)
-            groupes.setdefault(cle_groupe, [])
-
-            montant_initial_tranche = self.calculate_montant_initial_tranche(marche, tranche)
-
-            # L'enveloppe du groupe cumule celles de ses marchés distincts.
-            vus = marches_vus.setdefault(cle_groupe, set())
-            if marche not in vus:
-                vus.add(marche)
-                montant_enveloppe, provenance = self._enveloppe_tranche(
-                    marche, tranche_libelle, float(montant_initial_tranche or 0), marches_totaux
+            # Montant initial de chaque tranche réellement présente dans SEDIT.
+            # Toutes sont retenues : un marché pluri-tranches se solde contre la
+            # somme de ses tranches, pas contre la première rencontrée.
+            montants_tranches: Dict[str, float] = {}
+            for tranche in df_marche.iloc[:, self.COL_TRANCHE].unique():
+                libelle_tranche = self.libelle_tranche(tranche)
+                if libelle_tranche in montants_tranches:
+                    continue
+                montants_tranches[libelle_tranche] = float(
+                    self.calculate_montant_initial_tranche(marche, tranche) or 0
                 )
-                enveloppes[cle_groupe] = enveloppes.get(cle_groupe, 0.0) + montant_enveloppe
-                # La provenance la moins fiable du groupe l'emporte : mieux vaut
-                # signaler un doute que laisser croire à un montant contractuel.
-                courante = provenances.get(cle_groupe, self.ENVELOPPE_BASE)
-                if self.RANG_PROVENANCE[provenance] >= self.RANG_PROVENANCE[courante]:
-                    provenances[cle_groupe] = provenance
+
+            enveloppes[marche], provenances[marche] = self._enveloppe_marche(
+                marche, sum(montants_tranches.values()), marches_totaux
+            )
 
             type_marche = marches_types.get(marche, 'CLASSIQUE')
 
@@ -1348,15 +1390,21 @@ class MarchesAnalyzer:
                     if self.extract_exercice_from_bdc(num_commande) != exercice_filter:
                         continue
 
+                # Prestataire et tranche sont portés par l'écriture : un marché
+                # peut être tenu par un groupement, et couvrir plusieurs
+                # tranches. Les lire sur la première ligne du marché attribuait
+                # les lignes des cotraitants au mandataire.
+                tranche_libelle = self.libelle_tranche(row.iloc[self.COL_TRANCHE])
+
                 # Une ligne sans BDC est rattachée à sa tranche : le montant de
                 # référence est alors le montant initial de la tranche.
                 montant_initial = _nombre(row, self.COL_MONTANT_INITIAL)
                 if not num_commande and montant_initial <= 0:
-                    montant_initial = float(montant_initial_tranche or 0)
+                    montant_initial = montants_tranches.get(tranche_libelle, 0.0)
 
-                groupes[cle_groupe].append(Ecriture(
+                groupes[marche].append(Ecriture(
                     marche=marche,
-                    fournisseur=fournisseur,
+                    fournisseur=_texte(row, self.COL_FOURNISSEUR),
                     tranche_libelle=tranche_libelle,
                     num_commande=num_commande,
                     libelle=_texte(row, self.COL_LIBELLE),
@@ -1506,15 +1554,13 @@ class MarchesAnalyzer:
 
             row_idx = 6
             color_index = 0
-            current_prestataire = None
 
-            for (fournisseur, tranche_libelle), resultat in resultats.items():
-                if current_prestataire != fournisseur:
-                    current_prestataire = fournisseur
-                    color_index += 1
+            for marche, resultat in resultats.items():
+                # Un bloc par lot : c'est le marché qui porte l'enveloppe.
+                color_index += 1
                 current_fill = fill_gray if color_index % 2 == 1 else fill_white
 
-                enveloppe = enveloppes.get((fournisseur, tranche_libelle), 0.0)
+                enveloppe = enveloppes.get(marche, 0.0)
                 # Solde glissant : un seul mode de calcul, l'enveloppe initiale
                 # moins le cumul des montants imputés depuis le début du groupe.
                 cumul_impute = 0.0
@@ -1555,9 +1601,9 @@ class MarchesAnalyzer:
 
                     row_idx += 1
 
-                # Sous-total du groupe.
+                # Sous-total du lot : le marché, ses tranches, ses prestataires.
                 total_impute = resultat.total_impute
-                ws_financier.cell(row_idx, 2, f"Sous-total Tranche {tranche_libelle} - {fournisseur}")
+                ws_financier.cell(row_idx, 2, self._libelle_sous_total(marche, resultat))
                 # Somme sur BDC distincts, jamais une somme de colonne.
                 ws_financier.cell(row_idx, 6, resultat.total_bdc_distincts)
                 ws_financier.cell(row_idx, 10, sum(l.montant_ht for l in resultat.lignes))

@@ -43,6 +43,23 @@ retirés en fin de libellé — une parenthèse ouverte n'y apporte rien —, ma
 parenthèse ouverte par une troncature ordinaire est conservée. Les n° de mandat,
 que SEDIT remonte comme des nombres, s'écrivent « 1470 » et non « 1470.0 ».
 
+### Un bloc par lot
+
+Le tableau est découpé en **un bloc par marché**, c'est-à-dire par lot : le
+marché est l'unité qui porte une enveloppe notifiée, donc la seule contre
+laquelle un solde ait un sens. Chaque bloc a son sous-total et son propre
+« restant ». Le prestataire et la tranche sont des attributs de l'**écriture**,
+pas du bloc — un marché peut être tenu par un groupement d'entreprises et
+couvrir plusieurs tranches ; les lire sur la première ligne du marché
+réattribuait au mandataire les lignes de ses cotraitants, et faisait dépendre
+le résultat de l'ordre de lecture des exports SEDIT.
+
+L'enveloppe d'un lot est lue en base (montant initial, tranches optionnelles et
+avenants) ; à défaut, elle est reconstituée depuis SEDIT **toutes tranches
+additionnées**. C'est le calcul de l'onglet *Opérations*, si bien que l'export
+et le tableau à l'écran ne peuvent plus afficher deux montants différents —
+n'en retenir qu'une tranche sous-évaluait 5 opérations de 767 935,72 €.
+
 Le classeur produit quatre onglets : `FINANCIER`, `A jour` (une ligne par BDC,
 issue du même jeu de données), `Anomalies` (montants de BDC à arbitrer) et
 `Lignes neutralisées` (trace des engagements supprimés ou ramenés au reliquat).
