@@ -211,6 +211,16 @@ L'interface est testée sans affichage (`QT_QPA_PLATFORM=offscreen`) ;
 `test_interface.py` et `test_filtres_ui.py` sont ignorés si PyQt5 n'est pas
 installé.
 
+Les cinq suites tournent à chaque poussée et sur chaque pull request
+(`.github/workflows/tests.yml`), sur Python 3.11 — la version pour laquelle
+`pandas==2.1.4` a un binaire. Les exports SEDIT et la base étant versionnés,
+les tests qui s'appuient dessus s'exécutent pour de bon au lieu d'être ignorés,
+et le job le vérifie avant de lancer quoi que ce soit.
+
+```bash
+python -m unittest discover -p 'test_*.py'   # les 193 d'un coup
+```
+
 
 ```bash
 python -m unittest test_suivi_financier.py -v
