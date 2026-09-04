@@ -37,6 +37,12 @@ Pour chaque BDC : `montant_ref = max(montant_bdc_déclaré, Σ factures mandaté
 et `reliquat = montant_ref - Σ factures`. Un BDC soldé n'a donc pas de ligne
 d'engagement, et un report d'exercice ne crée pas de second engagement.
 
+SEDIT tronque les libellés à largeur fixe : le marqueur `(REPORT)` en revient
+souvent amputé (`georeferencement obligatoire(REP`). Ces débuts de marqueur sont
+retirés en fin de libellé — une parenthèse ouverte n'y apporte rien —, mais une
+parenthèse ouverte par une troncature ordinaire est conservée. Les n° de mandat,
+que SEDIT remonte comme des nombres, s'écrivent « 1470 » et non « 1470.0 ».
+
 Le classeur produit quatre onglets : `FINANCIER`, `A jour` (une ligne par BDC,
 issue du même jeu de données), `Anomalies` (montants de BDC à arbitrer) et
 `Lignes neutralisées` (trace des engagements supprimés ou ramenés au reliquat).

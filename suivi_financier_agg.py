@@ -181,6 +181,14 @@ class ResultatSuivi:
         self.anomalies.extend(autre.anomalies)
 
 
+# SEDIT tronque le libelle a une largeur fixe : le marqueur de report arrive
+# donc parfois ampute — `georeferencement obligatoire(REP`. Ces debuts-la sont
+# retires en fin de libelle uniquement, ou une parenthese ouverte n'apporte
+# rien au lecteur quel que soit le mot qu'elle entamait. Du plus long au plus
+# court ; `(REPORT` et au-dela sont deja traites par substitution.
+FRAGMENTS_REPORT_TRONQUES = ("(REPOR", "(REPO", "(REP")
+
+
 def nettoyer_designation(libelle, longueur: int = LONGUEUR_DESIGNATION) -> str:
     """Nettoie un libelle SEDIT et le tronque *apres* nettoyage.
 
@@ -190,11 +198,22 @@ def nettoyer_designation(libelle, longueur: int = LONGUEUR_DESIGNATION) -> str:
     `G3P extension du reseau video su(REPORT)`.
     """
     texte = "" if libelle is None else str(libelle)
-    texte = texte.replace("(REPORT)", " ").replace("(REPORT", " ")
+    texte = texte.replace("(REPORT)", " ").replace("(REPORT", " ").rstrip()
+    for fragment in FRAGMENTS_REPORT_TRONQUES:
+        if texte.endswith(fragment):
+            texte = texte[: -len(fragment)]
+            break
     return " ".join(texte.split())[:longueur]
 
 
 def _est_report(libelle) -> bool:
+    """Vrai pour un marqueur de report *entier*.
+
+    Volontairement plus strict que `nettoyer_designation` : celle-ci retire un
+    fragment comme `(REP` parce qu'une parenthese ouverte en fin de libelle est
+    illisible de toute facon, alors qu'ici le fragment ne suffit pas a affirmer
+    un report — `(REPARATION` tronque donnerait le meme debut.
+    """
     return "(REPORT" in ("" if libelle is None else str(libelle))
 
 

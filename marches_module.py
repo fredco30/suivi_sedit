@@ -1275,6 +1275,24 @@ class MarchesAnalyzer:
             valeur = row.iloc[col]
             return "" if pd.isna(valeur) else str(valeur).strip()
 
+        def _identifiant(row, col) -> str:
+            """N° de facture ou de mandat, sans decimale parasite.
+
+            SEDIT remonte les n° de mandat comme des nombres : `str(1470.0)`
+            ecrivait « 1470.0 » dans l'export alors que le mandat s'appelle
+            « 1470 ». Le cache les conservant en texte, les deux formes
+            — flottant et chaine « 1470.0 » — se presentent selon la source.
+            """
+            valeur = row.iloc[col]
+            if pd.isna(valeur):
+                return ""
+            if isinstance(valeur, float):
+                return str(int(valeur)) if valeur.is_integer() else str(valeur)
+            texte = str(valeur).strip()
+            if texte.endswith(".0") and texte[:-2].lstrip("-").isdigit():
+                texte = texte[:-2]
+            return texte
+
         def _nombre(row, col) -> float:
             valeur = row.iloc[col]
             if pd.isna(valeur):
@@ -1342,8 +1360,8 @@ class MarchesAnalyzer:
                     tranche_libelle=tranche_libelle,
                     num_commande=num_commande,
                     libelle=_texte(row, self.COL_LIBELLE),
-                    num_facture=_texte(row, self.COL_FACTURE),
-                    num_mandat=_texte(row, self.COL_MANDAT),
+                    num_facture=_identifiant(row, self.COL_FACTURE),
+                    num_mandat=_identifiant(row, self.COL_MANDAT),
                     date_sf=_texte(row, self.COL_DATE_SF),
                     montant_ttc=_nombre(row, self.COL_MONTANT_TTC),
                     montant_sf=_nombre(row, self.COL_MONTANT_SF),

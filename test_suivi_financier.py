@@ -87,6 +87,21 @@ class TestNettoyageDesignation(unittest.TestCase):
         self.assertEqual(nettoyer_designation(None), "")
         self.assertEqual(nettoyer_designation(""), "")
 
+    def test_marqueur_report_tronque_par_sedit(self):
+        # SEDIT coupe le libelle a largeur fixe : le marqueur arrive ampute.
+        for fragment in ("(REPORT", "(REPOR", "(REPO", "(REP"):
+            self.assertEqual(
+                nettoyer_designation("georeferencement obligatoire" + fragment),
+                "georeferencement obligatoire",
+                fragment,
+            )
+
+    def test_parenthese_legitime_conservee(self):
+        # Une parenthese ouverte par une troncature ordinaire n'est pas un
+        # marqueur de report : elle reste, faute de quoi on amputerait le texte.
+        libelle = "G3P - CABLE HS Oree du Golf (allee de l'"
+        self.assertEqual(nettoyer_designation(libelle), libelle)
+
 
 class TestReglesAgregation(unittest.TestCase):
     """Regle : une ligne par etat de BDC, pas une ligne par ecriture SEDIT."""
@@ -447,10 +462,25 @@ class TestExportOperation(unittest.TestCase):
         self.assertAlmostEqual(impute, sum(distincts.values()), places=2)
 
     def test_aucun_suffixe_report_dans_les_designations(self):
-        # §2.3 : le suffixe est remplace par la colonne STATUT.
+        # §2.3 : le suffixe est remplace par la colonne STATUT, y compris
+        # lorsque SEDIT ne l'a remonte qu'ampute (« ...obligatoire(REP »).
         for row in range(6, self.ws.max_row + 1):
             designation = self.ws.cell(row, 2).value or ""
             self.assertNotIn("REPORT)", designation)
+            for fragment in ("(REPORT", "(REPOR", "(REPO", "(REP"):
+                self.assertFalse(designation.endswith(fragment), designation)
+
+    def test_numeros_de_mandat_sans_decimale(self):
+        # SEDIT remonte les mandats comme des nombres : « 1470.0 » n'est pas
+        # un n° de mandat, le mandat s'appelle « 1470 ».
+        mandats = [
+            str(self.ws.cell(row, 8).value)
+            for row in range(6, self.ws.max_row)
+            if self.ws.cell(row, 8).value
+        ]
+        self.assertTrue(mandats, "aucun mandat dans l'export de reference")
+        for mandat in mandats:
+            self.assertFalse(mandat.endswith(".0"), mandat)
 
 
 class TestResolutionNumeroBdc(unittest.TestCase):
