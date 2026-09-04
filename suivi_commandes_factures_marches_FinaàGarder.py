@@ -12,7 +12,8 @@ from marches_models import (
     MarchesGlobauxTableModel, MarchesTranchesTableModel,
     MarchesGlobauxProxy, MarchesTranchesProxy,
     OperationsTableModel, OperationsProxy,
-    HistoriqueTableModel, HistoriqueProxy
+    HistoriqueTableModel, HistoriqueProxy,
+    OPERATIONS_COLUMNS
 )
 from marches_dialogs import EditMarcheDialog
 
@@ -2866,13 +2867,15 @@ class MainWindow(QMainWindow):
         filtre_operation_layout = QHBoxLayout(filtre_operation_widget)
         filtre_operation_layout.setContentsMargins(0, 5, 0, 5)
 
-        label_filtre_operation = QLabel("🔍 Opération:")
+        label_filtre_operation = QLabel("🔍 Rechercher:")
         filtre_operation_layout.addWidget(label_filtre_operation)
 
         self.edit_filtre_operation = QLineEdit()
-        self.edit_filtre_operation.setPlaceholderText("Filtrer par code opération...")
+        self.edit_filtre_operation.setPlaceholderText(
+            "Code opération, marché, libellé ou fournisseur..."
+        )
         self.edit_filtre_operation.setClearButtonEnabled(True)
-        self.edit_filtre_operation.setMaximumWidth(200)
+        self.edit_filtre_operation.setMaximumWidth(320)
         self.edit_filtre_operation.textChanged.connect(
             lambda text: self.operations_proxy.setOperationFilter(text)
         )
@@ -2934,18 +2937,26 @@ class MainWindow(QMainWindow):
 
         # Définir des largeurs initiales optimales pour chaque colonne
         # Colonnes: Opération, Nb lots, Marchés, Libellé, Fournisseur, Montant initial, Avenants, SF, Payé, Reste réaliser, Reste mandater, %
-        self.table_operations.setColumnWidth(0, 120)  # Opération
-        self.table_operations.setColumnWidth(1, 60)   # Nb lots
-        self.table_operations.setColumnWidth(2, 250)  # Marchés (word wrap sur 3 lignes)
-        self.table_operations.setColumnWidth(3, 300)  # Libellé (word wrap sur 3 lignes)
-        self.table_operations.setColumnWidth(4, 200)  # Fournisseur (word wrap)
-        self.table_operations.setColumnWidth(5, 120)  # Montant initial
-        self.table_operations.setColumnWidth(6, 70)   # Avenants
-        self.table_operations.setColumnWidth(7, 120)  # Service fait
-        self.table_operations.setColumnWidth(8, 120)  # Payé
-        self.table_operations.setColumnWidth(9, 120)  # Reste à réaliser
-        self.table_operations.setColumnWidth(10, 120) # Reste à mandater
-        self.table_operations.setColumnWidth(11, 80)  # % consommé
+        # Largeurs désignées par le nom de la colonne : une colonne insérée ne
+        # décale plus les suivantes.
+        largeurs_operations = {
+            "operation": 120,
+            "nb_lots": 60,
+            "marches": 250,          # word wrap sur 3 lignes
+            "libelle": 300,          # word wrap sur 3 lignes
+            "fournisseur": 200,      # word wrap
+            "montant_initial_total": 120,
+            "provenance_enveloppe": 120,
+            "nb_avenants_total": 70,
+            "service_fait_total": 120,
+            "paye_total": 120,
+            "reste_a_realiser": 120,
+            "reste_a_mandater": 120,
+            "pourcent_consomme": 80,
+        }
+        for colonne, (cle, _) in enumerate(OPERATIONS_COLUMNS):
+            if cle in largeurs_operations:
+                self.table_operations.setColumnWidth(colonne, largeurs_operations[cle])
 
         # Permettre le redimensionnement manuel par l'utilisateur
         header_operations_table.setStretchLastSection(False)

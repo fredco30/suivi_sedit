@@ -159,6 +159,26 @@ Deux boutons couvrent le même besoin sans passer par la ligne de commande :
   rend exactement le tableau que produisait le bouton en dur — un test le
   vérifie feuille contre feuille.
 
+### Onglet Opérations
+
+Une colonne **Enveloppe** dit ce que vaut le « Montant initial total » de la
+ligne : `✓ notifiée` (lue en base), `≈ reconstituée` (somme des engagements
+SEDIT, à saisir en base) ou `⚠ non saisie`. Il fallait auparavant ouvrir le
+fichier exporté pour l'apprendre. Le tableau et l'export passent par la même
+fonction, `_enveloppe_marche` : la colonne annonce ce que dira le fichier.
+Trier la colonne classe par fiabilité, non par ordre alphabétique — c'est ce
+qui rassemble les enveloppes restant à saisir. Une opération sans enveloppe
+apparaît en gris : son pourcentage consommé vaut 0, et elle passait au vert
+« peu consommé » alors que rien n'est calculé.
+
+Le champ de recherche du bandeau porte sur le **code opération, les codes de
+lot, le libellé et le titulaire** — il ne connaissait que le code opération,
+alors que le tableau affiche les trois autres. Chercher un code de lot trouve
+l'opération qui le porte.
+
+La colonne **Fournisseur** liste tous les titulaires, cotraitants compris : un
+marché tenu par un groupement n'affichait que son mandataire.
+
 ### Filtres (Commandes, Rappels, Factures, Facturation)
 
 Les filtres **Marché** et **Fournisseur** sont à sélection multiple avec

@@ -568,9 +568,14 @@ class MarchesAnalyzer:
         for marche in marches_uniques:
             df_marche = self.df_marches[self.df_marches.iloc[:, self.COL_MARCHE] == marche]
 
-            # Récupérer le fournisseur (prendre le premier non vide)
-            fournisseurs = df_marche.iloc[:, self.COL_FOURNISSEUR].dropna()
-            fournisseur = fournisseurs.iloc[0] if len(fournisseurs) > 0 else ""
+            # Tous les titulaires du marché : un marché peut être tenu par un
+            # groupement, et n'en retenir qu'un effaçait ses cotraitants.
+            fournisseurs = []
+            for valeur in df_marche.iloc[:, self.COL_FOURNISSEUR].dropna():
+                titulaire = str(valeur).strip()
+                if titulaire and titulaire not in fournisseurs:
+                    fournisseurs.append(titulaire)
+            fournisseur = " / ".join(fournisseurs)
 
             # Récupérer le libellé (prendre le premier non vide)
             libelles = df_marche.iloc[:, self.COL_LIBELLE].dropna()
@@ -579,28 +584,27 @@ class MarchesAnalyzer:
             # Calculer le montant initial du marché
             # Priorité 1: Montant manuel + avenants depuis la BD
             # Priorité 2: Calcul automatique depuis Excel (somme des tranches)
-            montant_initial_marche = 0.0
             montant_excel = 0.0
             nb_avenants = 0
 
-            if self.db:
-                # Essayer de récupérer le montant depuis la base de données
-                montant_bd = self.db.get_montant_total_marche(marche)
-                if montant_bd > 0:
-                    montant_initial_marche = montant_bd
-
-                    # Récupérer le nombre d'avenants pour affichage
-                    avenants = self.db.get_avenants(marche)
-                    nb_avenants = len(avenants) if avenants else 0
-
-            # Si pas de montant manuel en BD, calculer depuis Excel
-            if montant_initial_marche == 0:
+            montant_bd = self.db.get_montant_total_marche(marche) if self.db else 0.0
+            if montant_bd > 0 and self.db:
+                # Récupérer le nombre d'avenants pour affichage
+                avenants = self.db.get_avenants(marche)
+                nb_avenants = len(avenants) if avenants else 0
+            else:
+                # Pas de montant en base : reconstitution depuis l'export SEDIT.
                 tranches = df_marche.iloc[:, self.COL_TRANCHE].unique()
                 montant_excel = sum(
-                    self.calculate_montant_initial_tranche(marche, t)
+                    float(self.calculate_montant_initial_tranche(marche, t) or 0)
                     for t in tranches
                 )
-                montant_initial_marche = montant_excel
+
+            # Même fonction que l'export : les deux vues ne peuvent pas
+            # afficher deux enveloppes différentes pour un même marché.
+            montant_initial_marche, provenance_enveloppe = self._enveloppe_marche(
+                montant_bd, montant_excel
+            )
 
             # Service fait cumulé (somme de AH pour tout le marché)
             sf = df_marche.iloc[:, self.COL_MONTANT_SF].copy()
@@ -632,6 +636,8 @@ class MarchesAnalyzer:
                 'operation': code_operation,
                 'libelle_marche': libelle,
                 'fournisseur': fournisseur,
+                'fournisseurs': fournisseurs,
+                'provenance_enveloppe': provenance_enveloppe,
                 'montant_initial_marche': montant_initial_marche,
                 'service_fait_cumule': service_fait_cumule,
                 'paye_cumule': paye_cumule,
@@ -747,6 +753,7 @@ class MarchesAnalyzer:
                     'marches': [],
                     'libelles': [],
                     'fournisseurs': [],
+                    'provenance_enveloppe': self.ENVELOPPE_BASE,
                     'montant_initial_total': 0.0,
                     'service_fait_total': 0.0,
                     'paye_total': 0.0,
@@ -761,10 +768,20 @@ class MarchesAnalyzer:
             if libelle and libelle not in op['libelles']:
                 op['libelles'].append(libelle)
 
-            # Ajouter le fournisseur s'il n'est pas déjà présent
-            fournisseur = marche_data.get('fournisseur', '')
-            if fournisseur and fournisseur not in op['fournisseurs']:
-                op['fournisseurs'].append(fournisseur)
+            # Tous les titulaires, cotraitants compris.
+            for fournisseur in marche_data.get(
+                'fournisseurs', [marche_data.get('fournisseur', '')]
+            ):
+                if fournisseur and fournisseur not in op['fournisseurs']:
+                    op['fournisseurs'].append(fournisseur)
+
+            # La provenance la moins fiable l'emporte : mieux vaut signaler un
+            # doute que laisser croire à une enveloppe contractuelle.
+            provenance = marche_data.get('provenance_enveloppe', self.ENVELOPPE_ABSENTE)
+            if self.RANG_PROVENANCE[provenance] >= self.RANG_PROVENANCE[
+                op['provenance_enveloppe']
+            ]:
+                op['provenance_enveloppe'] = provenance
 
             op['montant_initial_total'] += marche_data['montant_initial_marche']
             op['service_fait_total'] += marche_data['service_fait_cumule']
@@ -788,7 +805,7 @@ class MarchesAnalyzer:
 
             # Combiner les libellés et fournisseurs
             libelle_combined = " | ".join(data['libelles']) if data['libelles'] else ""
-            fournisseur_combined = " | ".join(data['fournisseurs']) if data['fournisseurs'] else ""
+            fournisseur_combined = " / ".join(data['fournisseurs']) if data['fournisseurs'] else ""
 
             results.append({
                 'operation': operation,
@@ -796,6 +813,7 @@ class MarchesAnalyzer:
                 'marches': data['marches'],
                 'libelle': libelle_combined,
                 'fournisseur': fournisseur_combined,
+                'provenance_enveloppe': data['provenance_enveloppe'],
                 'montant_initial_total': montant_initial,
                 'service_fait_total': sf_total,
                 'paye_total': paye_total,
@@ -1198,8 +1216,8 @@ class MarchesAnalyzer:
             return str(tranche)
         return "TF" if numero == 0 else f"TO{numero}"
 
-    def _enveloppe_marche(self, marche: str, montant_sedit: float,
-                          marches_totaux: Dict[str, float]) -> Tuple[float, str]:
+    def _enveloppe_marche(self, montant_base: float,
+                          montant_sedit: float) -> Tuple[float, str]:
         """Enveloppe initiale d'un marché — donc d'un lot —, et sa provenance.
 
         L'unité qui porte une enveloppe est le marché : un lot est un marché à
@@ -1215,15 +1233,15 @@ class MarchesAnalyzer:
         puissent pas diverger.
 
         Args:
+            montant_base: enveloppe lue en base, 0 si le marché n'y est pas.
             montant_sedit: reconstitution SEDIT, somme des tranches du marché.
 
         Returns:
             (montant, provenance) où provenance vaut ENVELOPPE_BASE,
             ENVELOPPE_SEDIT ou ENVELOPPE_ABSENTE.
         """
-        montant_marche = float(marches_totaux.get(marche, 0) or 0)
-        if montant_marche > 0:
-            return montant_marche, self.ENVELOPPE_BASE
+        if float(montant_base or 0) > 0:
+            return float(montant_base), self.ENVELOPPE_BASE
         if montant_sedit > 0:
             return montant_sedit, self.ENVELOPPE_SEDIT
         return 0.0, self.ENVELOPPE_ABSENTE
@@ -1391,7 +1409,7 @@ class MarchesAnalyzer:
                 )
 
             enveloppes[marche], provenances[marche] = self._enveloppe_marche(
-                marche, sum(montants_tranches.values()), marches_totaux
+                marches_totaux.get(marche, 0.0), sum(montants_tranches.values())
             )
 
             type_marche = marches_types.get(marche, 'CLASSIQUE')

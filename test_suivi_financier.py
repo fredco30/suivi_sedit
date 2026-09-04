@@ -997,6 +997,25 @@ class TestGroupementParLot(unittest.TestCase):
                 msg=operation["operation"],
             )
 
+    def test_provenance_identique_a_l_onglet_operations(self):
+        """La colonne « Enveloppe » du tableau annonce ce que dira l'export.
+
+        L'une et l'autre passent par `_enveloppe_marche` : le tableau ne peut
+        pas afficher « notifiée » là où le fichier écrira « reconstituée ».
+        """
+        for operation in self.operations:
+            _, _, _, provenances, info = self.analyzer.collecter_ecritures_operation(
+                operation["operation"]
+            )
+            if info is None or not provenances:
+                continue
+            pire = max(
+                provenances.values(), key=lambda p: self.analyzer.RANG_PROVENANCE[p]
+            )
+            self.assertEqual(
+                operation["provenance_enveloppe"], pire, operation["operation"]
+            )
+
     def test_prestataire_lu_sur_l_ecriture(self):
         """Un marche tenu par un groupement garde ses cotraitants.
 

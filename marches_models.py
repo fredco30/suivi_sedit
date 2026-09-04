@@ -39,6 +39,18 @@ MARCHES_TRANCHES_COLUMNS = [
 
 # ============== COLONNES POUR LA VISION OPÉRATIONS ==============
 
+# Ce que vaut le « Montant initial total » de la ligne : une enveloppe notifiée
+# lue en base, une reconstitution depuis les engagements SEDIT, ou rien. Sans
+# cette colonne il fallait ouvrir le fichier exporté pour l'apprendre.
+PROVENANCES_ENVELOPPE = {
+    "base": ("✓ notifiée", "Enveloppe lue en base : montant initial, tranches et avenants."),
+    "sedit": ("≈ reconstituée", "Reconstituée depuis les engagements SEDIT — "
+                                "à saisir en base pour que le solde ait un sens."),
+    "absente": ("⚠ non saisie", "Aucune enveloppe : le solde de cette opération "
+                                "n'est pas calculable."),
+}
+
+
 OPERATIONS_COLUMNS = [
     ("operation", "Opération"),
     ("nb_lots", "Nb lots"),
@@ -46,6 +58,7 @@ OPERATIONS_COLUMNS = [
     ("libelle", "Libellé"),
     ("fournisseur", "Fournisseur"),
     ("montant_initial_total", "Montant initial\ntotal"),
+    ("provenance_enveloppe", "Enveloppe"),
     ("nb_avenants_total", "Avenants"),
     ("service_fait_total", "Service fait\ntotal"),
     ("paye_total", "Payé\ntotal"),
@@ -152,6 +165,11 @@ class MarchesGlobauxTableModel(QAbstractTableModel):
             return Qt.AlignLeft | Qt.AlignVCenter
 
         if role == Qt.BackgroundRole:
+            # Sans enveloppe, le pourcentage consommé vaut 0 et la ligne
+            # passait au vert : « peu consommé » alors que rien n'est calculé.
+            if row_data.get("provenance_enveloppe") == "absente":
+                return QBrush(QColor("#eeeeee"))
+
             # Coloration selon le pourcentage consommé
             pourcent = row_data.get("pourcent_consomme", 0)
             if pourcent >= 100:
@@ -436,6 +454,10 @@ class OperationsTableModel(QAbstractTableModel):
                     except:
                         return str(value)
 
+            # Provenance de l'enveloppe
+            if key == "provenance_enveloppe":
+                return PROVENANCES_ENVELOPPE.get(value, ("", ""))[0]
+
             # Formatage du nombre de lots
             if key == "nb_lots":
                 return str(value) if value else "1"
@@ -462,17 +484,26 @@ class OperationsTableModel(QAbstractTableModel):
                 marches = row_data.get("marches", [])
                 if isinstance(marches, list) and len(marches) > 1:
                     return "Lots: " + ", ".join(marches)
+            if key in ("provenance_enveloppe", "montant_initial_total"):
+                provenance = row_data.get("provenance_enveloppe")
+                if provenance in PROVENANCES_ENVELOPPE:
+                    return PROVENANCES_ENVELOPPE[provenance][1]
 
         if role == Qt.TextAlignmentRole:
             # Alignement à droite pour les montants et pourcentages
             if key in ("montant_initial_total", "service_fait_total", "paye_total",
                       "reste_a_realiser", "reste_a_mandater", "pourcent_consomme"):
                 return Qt.AlignRight | Qt.AlignVCenter
-            if key in ("nb_lots", "nb_avenants_total"):
+            if key in ("nb_lots", "nb_avenants_total", "provenance_enveloppe"):
                 return Qt.AlignCenter | Qt.AlignVCenter
             return Qt.AlignLeft | Qt.AlignVCenter
 
         if role == Qt.BackgroundRole:
+            # Sans enveloppe, le pourcentage consommé vaut 0 et la ligne
+            # passait au vert : « peu consommé » alors que rien n'est calculé.
+            if row_data.get("provenance_enveloppe") == "absente":
+                return QBrush(QColor("#eeeeee"))
+
             # Coloration selon le pourcentage consommé
             pourcent = row_data.get("pourcent_consomme", 0)
             if pourcent >= 100:
@@ -608,10 +639,20 @@ class OperationsProxy(QSortFilterProxyModel):
 
         row = src.rows[source_row]
 
-        # Filtre par opération
+        # Le filtre portait sur le seul code opération, alors que le tableau
+        # affiche aussi le libellé et le titulaire : retrouver une opération
+        # par le nom de son entreprise était impossible.
         if self.filter_operation:
-            operation = str(row.get("operation", "")).lower()
-            if self.filter_operation.lower() not in operation:
+            marches = row.get("marches") or []
+            if not isinstance(marches, list):
+                marches = [marches]
+            champs = " ".join([
+                str(row.get("operation", "")),
+                str(row.get("libelle", "")),
+                str(row.get("fournisseur", "")),
+                " ".join(str(m) for m in marches),
+            ]).lower()
+            if self.filter_operation.lower() not in champs:
                 return False
 
         return True
@@ -647,6 +688,13 @@ class OperationsProxy(QSortFilterProxyModel):
                 rv = int(rv) if rv != "" else 0
             except:
                 pass
+
+        # Tri par fiabilité, non par ordre alphabétique : trier la colonne
+        # sert à rassembler les enveloppes qui restent à saisir.
+        if key == "provenance_enveloppe":
+            ordre = list(PROVENANCES_ENVELOPPE)
+            lv = ordre.index(lv) if lv in ordre else len(ordre)
+            rv = ordre.index(rv) if rv in ordre else len(ordre)
 
         return lv < rv
 

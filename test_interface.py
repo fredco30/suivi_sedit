@@ -578,6 +578,144 @@ class TestExportDepuisInterface(BaseTestInterface):
         self.assertTrue(recus["journal"])
 
 
+class TestOngletOperations(BaseTestInterface):
+    """Colonne « Enveloppe » et recherche du bandeau Opérations."""
+
+    def setUp(self):
+        super().setUp()
+        from marches_models import OperationsProxy, OperationsTableModel
+
+        self.analyzer.invalider_vision()
+        self.operations = self.analyzer.get_vision_operations()
+        self.modele = OperationsTableModel(list(self.operations))
+        self.proxy = OperationsProxy()
+        self.proxy.setSourceModel(self.modele)
+
+    def _colonne(self, cle):
+        from marches_models import OPERATIONS_COLUMNS
+
+        return next(i for i, (k, _) in enumerate(OPERATIONS_COLUMNS) if k == cle)
+
+    def _ligne(self, code):
+        return next(i for i, op in enumerate(self.modele.rows) if op["operation"] == code)
+
+    def _affiche(self, code, cle, role=None):
+        from PyQt5.QtCore import Qt
+
+        index = self.modele.index(self._ligne(code), self._colonne(cle))
+        return self.modele.data(index, role or Qt.DisplayRole)
+
+    def test_provenance_de_l_enveloppe_affichee(self):
+        """Il fallait ouvrir le fichier exporté pour savoir ce que vaut le montant."""
+        from marches_models import PROVENANCES_ENVELOPPE
+
+        # 2020_14G3P est la seule opération dont l'enveloppe est en base ici.
+        self.assertEqual(
+            self._affiche("2020_14G3P", "provenance_enveloppe"),
+            PROVENANCES_ENVELOPPE["base"][0],
+        )
+
+        reconstituees = [
+            op["operation"] for op in self.operations
+            if op["provenance_enveloppe"] == "sedit"
+        ]
+        self.assertTrue(reconstituees, "aucune enveloppe reconstituée dans le jeu")
+        self.assertEqual(
+            self._affiche(reconstituees[0], "provenance_enveloppe"),
+            PROVENANCES_ENVELOPPE["sedit"][0],
+        )
+
+    def test_provenance_expliquee_en_infobulle(self):
+        from PyQt5.QtCore import Qt
+
+        for cle in ("provenance_enveloppe", "montant_initial_total"):
+            infobulle = self._affiche("2020_14G3P", cle, Qt.ToolTipRole)
+            self.assertIn("base", infobulle)
+
+    def test_une_operation_sans_enveloppe_n_est_pas_verte(self):
+        """Sans enveloppe le pourcentage vaut 0, et la ligne passait au vert."""
+        from PyQt5.QtCore import Qt
+
+        sans = [op["operation"] for op in self.operations
+                if op["provenance_enveloppe"] == "absente"]
+        if not sans:
+            self.skipTest("aucune opération sans enveloppe dans le jeu")
+
+        index = self.modele.index(self._ligne(sans[0]), 0)
+        couleur = self.modele.data(index, Qt.BackgroundRole).color().name()
+        self.assertEqual(couleur, "#eeeeee")
+
+    def test_provenance_la_moins_fiable_l_emporte_sur_l_operation(self):
+        """Un lot non saisi ne doit pas se cacher derrière un lot renseigné."""
+        for operation in self.operations:
+            provenances = {
+                marche["provenance_enveloppe"]
+                for marche in self.analyzer.get_vision_globale()
+                if marche["marche"] in operation["marches"]
+            }
+            if not provenances:
+                continue
+            attendue = max(
+                provenances, key=lambda p: self.analyzer.RANG_PROVENANCE[p]
+            )
+            self.assertEqual(
+                operation["provenance_enveloppe"], attendue, operation["operation"]
+            )
+
+    def test_tri_par_fiabilite_et_non_par_alphabet(self):
+        from PyQt5.QtCore import Qt
+
+        colonne = self._colonne("provenance_enveloppe")
+        self.proxy.sort(colonne, Qt.AscendingOrder)
+        ordre = [
+            self.proxy.sourceModel().rows[
+                self.proxy.mapToSource(self.proxy.index(ligne, 0)).row()
+            ]["provenance_enveloppe"]
+            for ligne in range(self.proxy.rowCount())
+        ]
+        rangs = [self.analyzer.RANG_PROVENANCE[p] for p in ordre]
+        self.assertEqual(rangs, sorted(rangs))
+
+    def test_tous_les_titulaires_sont_affiches(self):
+        """Un marché tenu par un groupement n'affichait que son mandataire."""
+        affiche = self._affiche("2020_14G3P", "fournisseur")
+        self.assertIn("BOUYGUES ENERGIES ET SERVICES", affiche)
+        self.assertIn("BE TECH SUD", affiche)
+
+    def test_recherche_par_fournisseur(self):
+        """Le filtre ne portait que sur le code opération."""
+        self.proxy.setOperationFilter("BOUYGUES")
+        trouvees = self._operations_visibles()
+        self.assertIn("2020_14G3P", trouvees)
+        self.assertLess(len(trouvees), len(self.operations))
+
+    def test_recherche_par_libelle(self):
+        self.proxy.setOperationFilter("éclairage")
+        self.assertIn("2020_14G3P", self._operations_visibles())
+
+    def test_recherche_par_code_de_lot(self):
+        """Chercher un lot trouve l'opération qui le porte."""
+        multi = next(
+            (op for op in self.operations if op["nb_lots"] > 1), None
+        )
+        if multi is None:
+            self.skipTest("aucune opération multi-lots dans le jeu")
+        self.proxy.setOperationFilter(multi["marches"][0])
+        self.assertIn(multi["operation"], self._operations_visibles())
+
+    def test_recherche_vide_montre_tout(self):
+        self.proxy.setOperationFilter("")
+        self.assertEqual(len(self._operations_visibles()), len(self.operations))
+
+    def _operations_visibles(self):
+        return [
+            self.proxy.sourceModel().rows[
+                self.proxy.mapToSource(self.proxy.index(ligne, 0)).row()
+            ]["operation"]
+            for ligne in range(self.proxy.rowCount())
+        ]
+
+
 class TestDialogueExport(BaseTestInterface):
     """Ce que la fenêtre de choix propose, et ce qu'elle en conclut."""
 
