@@ -144,8 +144,20 @@ Deux boutons couvrent le même besoin sans passer par la ligne de commande :
   colonnes « engagé » et « facturé » ne sont que des repères. Le tableau
   s'exporte et se réimporte en `.xlsx` pour une saisie hors application, et rien
   n'est écrit tant que « Enregistrer » n'est pas cliqué.
-- **🔁 Tout régénérer** (onglet *Opérations*) régénère toutes les opérations dans
-  un dossier au choix, avec barre de progression et annulation.
+- **📊 Exporter le suivi financier** (onglet *Opérations*) ouvre un seul écran
+  pour tout l'export : la portée — la sélection du tableau (Ctrl/Maj pour en
+  prendre plusieurs), les opérations que le filtre laisse voir, ou toutes —,
+  l'exercice, le tri par n° de bon de commande et le journal de contrôle. Une
+  seule opération demande un nom de fichier, plusieurs demandent un dossier,
+  avec barre de progression et annulation.
+
+  Ce bouton en remplace trois : « Exporter suivi financier » (une opération,
+  sans choix d'exercice), « Export 2020_14G3P » (une opération **écrite en
+  dur**, seule à donner accès au choix d'exercice, au tri par BDC et au
+  journal) et « Tout régénérer » (toutes les opérations, sans aucune option, et
+  sans tenir compte du filtre affiché). Cocher les deux options de présentation
+  rend exactement le tableau que produisait le bouton en dur — un test le
+  vérifie feuille contre feuille.
 
 ### Filtres (Commandes, Rappels, Factures, Facturation)
 

@@ -2878,10 +2878,14 @@ class MainWindow(QMainWindow):
         )
         filtre_operation_layout.addWidget(self.edit_filtre_operation)
 
-        # Bouton d'export suivi financier
-        btn_export_operation = QPushButton("📊 Exporter suivi financier")
-        btn_export_operation.setMaximumWidth(200)
-        btn_export_operation.setStyleSheet("""
+        # Un seul bouton : la portée (sélection, filtre, tout) et les options
+        # se choisissent dans la fenêtre qu'il ouvre.
+        self.btn_export_suivi = QPushButton("📊 Exporter le suivi financier")
+        self.btn_export_suivi.setMaximumWidth(230)
+        self.btn_export_suivi.setToolTip(
+            "Exporter la sélection, les opérations filtrées ou toutes les opérations."
+        )
+        self.btn_export_suivi.setStyleSheet("""
             QPushButton {
                 background-color: #28a745;
                 color: white;
@@ -2897,55 +2901,8 @@ class MainWindow(QMainWindow):
                 background-color: #1e7e34;
             }
         """)
-        btn_export_operation.clicked.connect(self.export_suivi_financier_operation)
-        filtre_operation_layout.addWidget(btn_export_operation)
-
-        # Bouton d'export spécifique 2020_14G3P
-        btn_export_operation_2020 = QPushButton("📊 Export 2020_14G3P")
-        btn_export_operation_2020.setMaximumWidth(200)
-        btn_export_operation_2020.setStyleSheet("""
-            QPushButton {
-                background-color: #6f42c1;
-                color: white;
-                border: none;
-                padding: 8px 15px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #5a32a3;
-            }
-            QPushButton:pressed {
-                background-color: #4e2b8a;
-            }
-        """)
-        btn_export_operation_2020.clicked.connect(self.export_suivi_financier_2020_14G3P)
-        filtre_operation_layout.addWidget(btn_export_operation_2020)
-
-        # Régénération en lot de toutes les opérations
-        btn_regenerer_tout = QPushButton("🔁 Tout régénérer")
-        btn_regenerer_tout.setMaximumWidth(180)
-        btn_regenerer_tout.setToolTip(
-            "Régénérer le suivi financier de toutes les opérations dans un dossier."
-        )
-        btn_regenerer_tout.clicked.connect(self.regenerer_tous_les_suivis)
-        btn_regenerer_tout.setStyleSheet("""
-            QPushButton {
-                background-color: #17a2b8;
-                color: white;
-                border: none;
-                padding: 8px 15px;
-                border-radius: 4px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #138496;
-            }
-            QPushButton:pressed {
-                background-color: #0f6674;
-            }
-        """)
-        filtre_operation_layout.addWidget(btn_regenerer_tout)
+        self.btn_export_suivi.clicked.connect(self.exporter_suivi_financier)
+        filtre_operation_layout.addWidget(self.btn_export_suivi)
 
         filtre_operation_layout.addStretch()
 
@@ -2956,7 +2913,8 @@ class MainWindow(QMainWindow):
         self.table_operations.setModel(self.operations_proxy)
         self.table_operations.setSortingEnabled(True)
         self.table_operations.setSelectionBehavior(QTableView.SelectRows)
-        self.table_operations.setSelectionMode(QTableView.SingleSelection)
+        # Plusieurs opérations peuvent être exportées d'un coup (Ctrl/Maj).
+        self.table_operations.setSelectionMode(QTableView.ExtendedSelection)
         self.table_operations.setWordWrap(True)
 
         # Optimisation de la hauteur des lignes (3 lignes max)
@@ -6059,8 +6017,39 @@ class MainWindow(QMainWindow):
             self.marches_analyzer.invalider_vision()
             self.refresh_marches_data()
 
-    def regenerer_tous_les_suivis(self):
-        """Régénère le suivi financier de toutes les opérations dans un dossier."""
+    def _operations_selectionnees(self):
+        """Codes des opérations sélectionnées dans le tableau, dans l'ordre affiché."""
+        codes = []
+        modele = self.table_operations.selectionModel()
+        if modele is None:
+            return codes
+        for index in modele.selectedRows():
+            source = self.operations_proxy.mapToSource(index)
+            if 0 <= source.row() < len(self.operations_model.rows):
+                code = self.operations_model.rows[source.row()].get('operation', '')
+                if code and code not in codes:
+                    codes.append(code)
+        return codes
+
+    def _operations_visibles(self):
+        """Codes des opérations que le filtre laisse voir, dans l'ordre affiché."""
+        codes = []
+        for ligne in range(self.operations_proxy.rowCount()):
+            source = self.operations_proxy.mapToSource(self.operations_proxy.index(ligne, 0))
+            if 0 <= source.row() < len(self.operations_model.rows):
+                code = self.operations_model.rows[source.row()].get('operation', '')
+                if code and code not in codes:
+                    codes.append(code)
+        return codes
+
+    def exporter_suivi_financier(self):
+        """Point d'entrée unique de l'export du suivi financier.
+
+        Remplace les trois boutons d'autrefois : la portée (sélection, filtre,
+        tout) et les options se choisissent dans une même fenêtre, si bien que
+        le filtre par exercice et la présentation de contrôle ne sont plus
+        réservés à l'opération qui était écrite en dur.
+        """
         if not self.marches_analyzer:
             QMessageBox.warning(
                 self,
@@ -6069,50 +6058,96 @@ class MainWindow(QMainWindow):
             )
             return
 
-        operations = [op['operation'] for op in self.marches_analyzer.get_vision_operations()]
-        if not operations:
-            QMessageBox.warning(self, "Aucune opération", "Aucune opération à régénérer.")
+        toutes = [op['operation'] for op in self.marches_analyzer.get_vision_operations()]
+        if not toutes:
+            QMessageBox.warning(self, "Aucune opération", "Aucune opération à exporter.")
             return
 
-        dossier = QFileDialog.getExistingDirectory(
-            self, "Dossier de destination des suivis régénérés"
+        from export_suivi_dialog import ExportSuiviFinancierDialog
+
+        dialogue = ExportSuiviFinancierDialog(
+            selection=self._operations_selectionnees(),
+            filtrees=self._operations_visibles(),
+            toutes=toutes,
+            exercices=self.marches_analyzer.exercices_disponibles(),
+            parent=self,
         )
-        if not dossier:
+        if dialogue.exec_() != QDialog.Accepted:
             return
 
-        confirmation = QMessageBox.question(
-            self,
-            "Régénérer tous les suivis",
-            f"Régénérer {len(operations)} suivi(s) financier(s) dans :\n{dossier}\n\n"
-            "Les fichiers portant le même nom seront remplacés.\n\nContinuer ?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes
-        )
-        if confirmation != QMessageBox.Yes:
+        self._ecrire_suivis(dialogue.choix())
+
+    def _ecrire_suivis(self, choix):
+        """Écrit les suivis demandés, un fichier par opération."""
+        if not choix.operations:
             return
 
-        from PyQt5.QtWidgets import QProgressDialog
+        from PyQt5.QtWidgets import QFileDialog
 
-        progression = QProgressDialog(
-            "Régénération des suivis financiers...", "Annuler", 0, len(operations), self
-        )
-        progression.setWindowTitle("Régénération en cours")
-        progression.setWindowModality(Qt.WindowModal)
-        progression.setMinimumDuration(0)
+        if choix.multiple:
+            dossier = QFileDialog.getExistingDirectory(
+                self, "Dossier de destination des suivis financiers"
+            )
+            if not dossier:
+                return
+            destinations = [
+                (code, os.path.join(dossier, f"suivi_financier_{code}.xlsx"))
+                for code in choix.operations
+            ]
+        else:
+            code = choix.operations[0]
+            filepath, _ = QFileDialog.getSaveFileName(
+                self,
+                f"Exporter le suivi financier de {code}",
+                f"suivi_financier_{code}.xlsx",
+                "Excel Files (*.xlsx)"
+            )
+            if not filepath:
+                return
+            dossier = os.path.dirname(filepath)
+            destinations = [(code, filepath)]
+
+        if choix.multiple:
+            confirmation = QMessageBox.question(
+                self,
+                "Exporter le suivi financier",
+                f"Exporter {len(destinations)} suivi(s) financier(s) dans :\n{dossier}\n\n"
+                "Les fichiers portant le même nom seront remplacés.\n\nContinuer ?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes
+            )
+            if confirmation != QMessageBox.Yes:
+                return
+
+        progression = None
+        if choix.multiple:
+            from PyQt5.QtWidgets import QProgressDialog
+
+            progression = QProgressDialog(
+                "Export des suivis financiers...", "Annuler", 0, len(destinations), self
+            )
+            progression.setWindowTitle("Export en cours")
+            progression.setWindowModality(Qt.WindowModal)
+            progression.setMinimumDuration(0)
 
         reussites, echecs = [], []
-        for index, code_operation in enumerate(operations):
-            if progression.wasCanceled():
-                break
+        for index, (code_operation, filepath) in enumerate(destinations):
+            if progression is not None:
+                if progression.wasCanceled():
+                    break
+                progression.setLabelText(
+                    f"Opération {code_operation} ({index + 1}/{len(destinations)})"
+                )
+                progression.setValue(index)
+                QApplication.processEvents()
 
-            progression.setLabelText(f"Opération {code_operation} ({index + 1}/{len(operations)})")
-            progression.setValue(index)
-            QApplication.processEvents()
-
-            filepath = os.path.join(dossier, f"suivi_financier_{code_operation}.xlsx")
             try:
                 ok = self.marches_analyzer.export_suivi_financier_operation(
-                    code_operation, filepath, exercice_filter=None, special_export=False
+                    code_operation,
+                    filepath,
+                    exercice_filter=choix.exercice,
+                    trier_par_bdc=choix.trier_par_bdc,
+                    journal=choix.journal,
                 )
             except Exception as e:
                 print(f"[ERREUR] {code_operation} : {e}")
@@ -6120,176 +6155,43 @@ class MainWindow(QMainWindow):
 
             (reussites if ok else echecs).append(code_operation)
 
-        progression.setValue(len(operations))
-        annulee = progression.wasCanceled()
+        annulee = False
+        if progression is not None:
+            progression.setValue(len(destinations))
+            annulee = progression.wasCanceled()
 
-        message = f"{len(reussites)} suivi(s) régénéré(s) dans :\n{dossier}"
+        self._rendre_compte_export(choix, reussites, echecs, dossier, destinations, annulee)
+
+    def _rendre_compte_export(self, choix, reussites, echecs, dossier, destinations, annulee):
+        """Annonce le résultat de l'export."""
+        if not choix.multiple and not echecs:
+            filepath = destinations[0][1]
+            precision = ""
+            if choix.exercice:
+                precision = f"\nExercice : {choix.exercice}"
+            QMessageBox.information(
+                self,
+                "Export réussi",
+                f"✅ Suivi financier opération {reussites[0]} exporté !\n\n"
+                f"Fichier : {filepath}{precision}\n\n"
+                f"Le fichier contient 4 feuilles :\n"
+                f"• FINANCIER : Une ligne par état de BDC (factures mandatées + reliquat engagé)\n"
+                f"• A jour : Vue synthétique, une ligne par BDC\n"
+                f"• Anomalies : Montants de BDC à arbitrer\n"
+                f"• Lignes neutralisées : Trace des engagements soldés ou ramenés au reliquat"
+            )
+            return
+
+        message = f"{len(reussites)} suivi(s) exporté(s) dans :\n{dossier}"
         if annulee:
-            message = "Régénération interrompue.\n\n" + message
+            message = "Export interrompu.\n\n" + message
         if echecs:
             message += (f"\n\n{len(echecs)} en échec : "
                         f"{', '.join(echecs[:8])}"
                         + (" …" if len(echecs) > 8 else ""))
-            QMessageBox.warning(self, "Régénération terminée avec des échecs", message)
+            QMessageBox.warning(self, "Export terminé avec des échecs", message)
         else:
-            QMessageBox.information(self, "Régénération terminée", message)
-
-    def export_suivi_financier_operation(self):
-        """Exporte le suivi financier de l'opération sélectionnée."""
-        if not self.marches_analyzer:
-            QMessageBox.warning(
-                self,
-                "Données non chargées",
-                "Veuillez d'abord charger les données en cliquant sur 'Actualiser les données'."
-            )
-            return
-
-        # Récupérer l'opération sélectionnée
-        selected_indexes = self.table_operations.selectionModel().selectedRows()
-        if not selected_indexes:
-            QMessageBox.warning(
-                self,
-                "Aucune sélection",
-                "Veuillez sélectionner une opération à exporter."
-            )
-            return
-
-        # Récupérer le code de l'opération
-        source_index = self.operations_proxy.mapToSource(selected_indexes[0])
-        if source_index.row() >= len(self.operations_model.rows):
-            return
-
-        operation_data = self.operations_model.rows[source_index.row()]
-        code_operation = operation_data.get('operation', '')
-
-        if not code_operation:
-            QMessageBox.warning(
-                self,
-                "Erreur",
-                "Impossible de récupérer le code de l'opération."
-            )
-            return
-
-        exercice_choisi = None
-
-        # Demander le chemin du fichier
-        from PyQt5.QtWidgets import QFileDialog
-        default_filename = f"suivi_financier_{code_operation}.xlsx"
-        filepath, _ = QFileDialog.getSaveFileName(
-            self,
-            "Exporter suivi financier opération",
-            default_filename,
-            "Excel Files (*.xlsx)"
-        )
-
-        if not filepath:
-            return
-
-        # Exporter
-        try:
-            success = self.marches_analyzer.export_suivi_financier_operation(
-                code_operation,
-                filepath,
-                exercice_filter=exercice_choisi,
-                special_export=False
-            )
-
-            if success:
-                QMessageBox.information(
-                    self,
-                    "Export réussi",
-                    f"✅ Suivi financier opération {code_operation} exporté !\n\n"
-                    f"Fichier : {filepath}\n\n"
-                    f"Le fichier contient 4 feuilles :\n"
-                    f"• FINANCIER : Une ligne par état de BDC (factures mandatées + reliquat engagé)\n"
-                    f"• A jour : Vue synthétique, une ligne par BDC\n"
-                    f"• Anomalies : Montants de BDC à arbitrer\n"
-                    f"• Lignes neutralisées : Trace des engagements soldés ou ramenés au reliquat"
-                )
-            else:
-                QMessageBox.critical(
-                    self,
-                    "Erreur",
-                    "Une erreur est survenue lors de l'export.\n\n"
-                    "Consultez la console pour plus de détails."
-                )
-
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Erreur",
-                f"Une erreur est survenue lors de l'export :\n\n{str(e)}"
-            )
-
-    def export_suivi_financier_2020_14G3P(self):
-        """Export spécifique pour l'opération 2020_14G3P."""
-        if not self.marches_analyzer:
-            QMessageBox.warning(
-                self,
-                "Données non chargées",
-                "Veuillez d'abord charger les données en cliquant sur 'Actualiser les données'."
-            )
-            return
-
-        code_operation = "2020_14G3P"
-        exercices = self.marches_analyzer.get_exercices_for_operation(code_operation)
-
-        from PyQt5.QtWidgets import QInputDialog, QFileDialog
-        exercice_choisi, ok = QInputDialog.getItem(
-            self,
-            "Choisir l'exercice",
-            "Sélectionnez l'exercice à exporter :",
-            exercices,
-            0,
-            False
-        )
-        if not ok:
-            return
-
-        default_filename = f"suivi_financier_{code_operation}.xlsx"
-        filepath, _ = QFileDialog.getSaveFileName(
-            self,
-            "Exporter suivi financier 2020_14G3P",
-            default_filename,
-            "Excel Files (*.xlsx)"
-        )
-
-        if not filepath:
-            return
-
-        try:
-            success = self.marches_analyzer.export_suivi_financier_operation(
-                code_operation,
-                filepath,
-                exercice_filter=exercice_choisi,
-                special_export=True
-            )
-
-            if success:
-                QMessageBox.information(
-                    self,
-                    "Export réussi",
-                    f"✅ Suivi financier opération {code_operation} exporté !\n\n"
-                    f"Fichier : {filepath}\n\n"
-                    f"Le fichier contient 4 feuilles :\n"
-                    f"• FINANCIER : Une ligne par état de BDC (factures mandatées + reliquat engagé)\n"
-                    f"• A jour : Vue synthétique, une ligne par BDC\n"
-                    f"• Anomalies : Montants de BDC à arbitrer\n"
-                    f"• Lignes neutralisées : Trace des engagements soldés ou ramenés au reliquat"
-                )
-            else:
-                QMessageBox.critical(
-                    self,
-                    "Erreur",
-                    "Une erreur est survenue lors de l'export.\n\n"
-                    "Consultez la console pour plus de détails."
-                )
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "Erreur",
-                f"Une erreur est survenue lors de l'export :\n\n{str(e)}"
-            )
+            QMessageBox.information(self, "Export terminé", message)
 
     def export_marches_excel(self):
         """Exporte les données des marchés dans un fichier Excel avec 5 feuilles."""

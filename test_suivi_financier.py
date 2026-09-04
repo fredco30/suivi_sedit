@@ -1087,6 +1087,87 @@ class TestGroupementParLot(unittest.TestCase):
             )
 
 
+class TestOptionsExport(unittest.TestCase):
+    """Le tri et le journal se choisissent separement, sans changer le resultat."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.analyzer = _charger_analyzer()
+        if cls.analyzer is None:
+            raise unittest.SkipTest("données du dépôt indisponibles")
+
+    def _feuille(self, **options):
+        import openpyxl
+
+        with tempfile.TemporaryDirectory() as repertoire:
+            chemin = os.path.join(repertoire, "suivi.xlsx")
+            options.setdefault("exercice_filter", None)
+            self.assertTrue(self.analyzer.export_suivi_financier_operation(
+                MARCHE, chemin, **options
+            ))
+            feuille = openpyxl.load_workbook(chemin)["FINANCIER"]
+            return [
+                tuple(feuille.cell(ligne, colonne).value for colonne in range(1, 16))
+                for ligne in range(6, feuille.max_row + 1)
+            ]
+
+    def test_les_deux_options_reproduisent_l_ancien_export_special(self):
+        """Le bouton en dur ne faisait rien d'autre que cocher ces deux cases.
+
+        Il etait le seul chemin vers le tri par BDC et le journal de controle ;
+        la fenetre de choix les offre pour n'importe quelle operation, et doit
+        rendre exactement le meme tableau.
+        """
+        self.assertEqual(
+            self._feuille(trier_par_bdc=True, journal=True),
+            self._feuille(special_export=True),
+        )
+
+    def test_le_tri_par_bdc_ordonne_les_lignes(self):
+        bdc_tries = [ligne[4] for ligne in self._feuille(trier_par_bdc=True) if ligne[14] != "TOTAL"]
+        self.assertEqual(bdc_tries, sorted(bdc_tries))
+
+    def test_le_journal_est_ecrit_a_part_du_tri(self):
+        import shutil
+
+        journal = os.path.join("run_logs", f"export_{MARCHE}.log")
+        sauvegarde = journal + ".test"
+        existait = os.path.exists(journal)
+        if existait:
+            shutil.copy2(journal, sauvegarde)
+        try:
+            if existait:
+                os.remove(journal)
+            self._feuille(trier_par_bdc=True, journal=False)
+            self.assertFalse(os.path.exists(journal))
+
+            self._feuille(trier_par_bdc=False, journal=True)
+            self.assertTrue(os.path.exists(journal))
+        finally:
+            if existait:
+                shutil.move(sauvegarde, journal)
+            elif os.path.exists(journal):
+                os.remove(journal)
+
+    def test_exercices_disponibles_couvre_tout_le_jeu(self):
+        globaux = self.analyzer.exercices_disponibles()
+        self.assertEqual(globaux[0], "Tous")
+        self.assertGreater(len(globaux), 1)
+
+        # La liste d'une operation est incluse dans la liste globale.
+        pour_operation = self.analyzer.get_exercices_for_operation(MARCHE)
+        self.assertEqual(pour_operation[0], "Tous")
+        self.assertTrue(set(pour_operation) <= set(globaux))
+
+    def test_exercice_filtre_reduit_le_tableau(self):
+        exercices = [e for e in self.analyzer.get_exercices_for_operation(MARCHE) if e != "Tous"]
+        self.assertTrue(exercices, "aucun exercice sur l'opération de référence")
+
+        complet = self._feuille()
+        partiel = self._feuille(exercice_filter=exercices[0])
+        self.assertLess(len(partiel), len(complet))
+
+
 class TestLibelleSousTotal(unittest.TestCase):
     """L'intitule du sous-total n'enonce que ce que le bloc contient."""
 

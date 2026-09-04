@@ -8,7 +8,7 @@ import os
 
 import pandas as pd
 import numpy as np
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Sequence
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
@@ -136,23 +136,37 @@ class MarchesAnalyzer:
             return "Inconnu"
         return f"20{num_str[:2]}"
 
-    def get_exercices_for_operation(self, code_operation: str) -> List[str]:
-        """Retourne la liste des exercices disponibles pour une opération."""
-        operations_data = self.get_vision_operations()
-        operation_info = next((op for op in operations_data if op['operation'] == code_operation), None)
-        if not operation_info:
+    def exercices_disponibles(self, marches: Optional[Sequence[str]] = None) -> List[str]:
+        """Exercices présents dans les écritures, déduits des n° de BDC.
+
+        Args:
+            marches: restreint le relevé à ces marchés ; tous par défaut.
+
+        Returns:
+            ["Tous", "2024", "2025", …] — « Tous » toujours en tête.
+        """
+        if self.df_marches is None or len(self.df_marches) == 0:
             return ["Tous"]
 
-        marches_operation = operation_info['marches']
-        exercices = set()
-        for marche in marches_operation:
-            df_marche = self.df_marches[self.df_marches.iloc[:, self.COL_MARCHE] == marche]
-            for _, row in df_marche.iterrows():
-                num_commande = row.iloc[self.COL_COMMANDE] if not pd.isna(row.iloc[self.COL_COMMANDE]) else ""
-                exercices.add(self.extract_exercice_from_bdc(num_commande))
+        df = self.df_marches
+        if marches is not None:
+            df = df[df.iloc[:, self.COL_MARCHE].isin(list(marches))]
 
-        exercices_list = sorted(exercices)
-        return ["Tous"] + exercices_list
+        exercices = {
+            self.extract_exercice_from_bdc("" if pd.isna(valeur) else valeur)
+            for valeur in df.iloc[:, self.COL_COMMANDE].unique()
+        }
+        return ["Tous"] + sorted(exercices)
+
+    def get_exercices_for_operation(self, code_operation: str) -> List[str]:
+        """Retourne la liste des exercices disponibles pour une opération."""
+        operation_info = next(
+            (op for op in self.get_vision_operations() if op['operation'] == code_operation),
+            None,
+        )
+        if not operation_info:
+            return ["Tous"]
+        return self.exercices_disponibles(operation_info['marches'])
 
     def _resoudre_num_bdc(self, df: pd.DataFrame) -> pd.Series:
         """N° de bon de commande de chaque ligne SEDIT.
@@ -1424,7 +1438,9 @@ class MarchesAnalyzer:
         code_operation: str,
         filepath: str,
         exercice_filter: Optional[str] = None,
-        special_export: bool = False
+        special_export: bool = False,
+        trier_par_bdc: Optional[bool] = None,
+        journal: Optional[bool] = None,
     ) -> bool:
         """
         Génère un fichier Excel de suivi financier pour une opération spécifique.
@@ -1439,11 +1455,20 @@ class MarchesAnalyzer:
             code_operation: Code de l'opération (ex: "2024_1", "2024_17")
             filepath: Chemin du fichier Excel à créer
             exercice_filter: Exercice à filtrer (ex: "2024") ou "Tous"/None
-            special_export: Trie les BDC par numéro et écrit un log de contrôle
+            special_export: raccourci historique pour les deux options suivantes
+            trier_par_bdc: trie les lignes par n° de bon de commande
+            journal: écrit un journal de contrôle dans run_logs/
 
         Returns:
             True si succès, False sinon
         """
+        # `special_export` commandait les deux à la fois ; elles se choisissent
+        # désormais séparément, sans changer ce que produisaient ses appelants.
+        if trier_par_bdc is None:
+            trier_par_bdc = special_export
+        if journal is None:
+            journal = special_export
+
         try:
             from openpyxl import Workbook
             from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -1459,7 +1484,7 @@ class MarchesAnalyzer:
             resultats: Dict[Tuple[str, str], ResultatSuivi] = {}
             for cle_groupe, ecritures in groupes.items():
                 resultats[cle_groupe] = agreger_ecritures(
-                    ecritures, montants_declares, trier_par_bdc=special_export
+                    ecritures, montants_declares, trier_par_bdc=trier_par_bdc
                 )
 
             global_resultat = ResultatSuivi()
@@ -1545,7 +1570,7 @@ class MarchesAnalyzer:
                 cell.border = border_thin
 
             log_file = None
-            if special_export:
+            if journal:
                 import os
                 os.makedirs("run_logs", exist_ok=True)
                 log_path = os.path.join("run_logs", f"export_{code_operation}.log")

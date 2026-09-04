@@ -354,14 +354,14 @@ class _AnalyzerRestreint:
         return getattr(self._analyzer, nom)
 
 
-class TestRegenerationDepuisInterface(BaseTestInterface):
-    """Bouton « Tout régénérer » : mêmes fichiers que la commande en lot."""
+class TestExportDepuisInterface(BaseTestInterface):
+    """Bouton unique « Exporter le suivi financier » : portée et options."""
 
     def _fenetre(self):
         """Un vrai QWidget portant les méthodes de MainWindow que l'on teste.
 
         Instancier MainWindow ouvrirait la base de production et construirait
-        toute l'interface ; on emprunte les deux méthodes telles quelles, sur un
+        toute l'interface ; on emprunte les méthodes telles quelles, sur un
         parent Qt valide (les boîtes de dialogue en exigent un).
         """
         from PyQt5.QtWidgets import QWidget
@@ -370,72 +370,115 @@ class TestRegenerationDepuisInterface(BaseTestInterface):
 
         class FenetreDeTest(QWidget):
             saisir_enveloppes_marches = module.MainWindow.saisir_enveloppes_marches
-            regenerer_tous_les_suivis = module.MainWindow.regenerer_tous_les_suivis
+            exporter_suivi_financier = module.MainWindow.exporter_suivi_financier
+            _ecrire_suivis = module.MainWindow._ecrire_suivis
+            _rendre_compte_export = module.MainWindow._rendre_compte_export
+            _operations_selectionnees = module.MainWindow._operations_selectionnees
+            _operations_visibles = module.MainWindow._operations_visibles
 
         fenetre = FenetreDeTest()
         fenetre.db = self.db
         fenetre.marches_analyzer = self.analyzer
+        self._garnir_le_tableau(fenetre)
         self.addCleanup(fenetre.deleteLater)
         return fenetre
+
+    def _garnir_le_tableau(self, fenetre):
+        """Le vrai tableau des opérations, seul modèle que la portée consulte."""
+        from PyQt5.QtWidgets import QTableView
+        from marches_models import OperationsProxy, OperationsTableModel
+
+        fenetre.operations_model = OperationsTableModel(
+            list(self.analyzer.get_vision_operations())
+        )
+        fenetre.operations_proxy = OperationsProxy()
+        fenetre.operations_proxy.setSourceModel(fenetre.operations_model)
+        fenetre.table_operations = QTableView(fenetre)
+        fenetre.table_operations.setModel(fenetre.operations_proxy)
+        fenetre.table_operations.setSelectionBehavior(QTableView.SelectRows)
+        fenetre.table_operations.setSelectionMode(QTableView.ExtendedSelection)
+
+    def _choix(self, operations, **options):
+        from export_suivi_dialog import ChoixExport
+
+        return ChoixExport(
+            operations=list(operations),
+            exercice=options.get("exercice"),
+            trier_par_bdc=options.get("trier_par_bdc", False),
+            journal=options.get("journal", False),
+        )
+
+    def _codes(self, nombre):
+        return [op["operation"] for op in self.analyzer.get_vision_operations()[:nombre]]
 
     def test_avertit_si_les_donnees_ne_sont_pas_chargees(self):
         fenetre = self._fenetre()
         fenetre.marches_analyzer = None
-        fenetre.regenerer_tous_les_suivis()
+        fenetre.exporter_suivi_financier()
 
         self.assertEqual(self._titres(), ["Données non chargées"])
 
-    def test_regenere_toutes_les_operations(self):
+    def test_plusieurs_operations_vers_un_dossier(self):
         import PyQt5.QtWidgets as W
 
         destination = os.path.join(self.repertoire, "exports")
         os.makedirs(destination)
+        codes = self._codes(3)
 
         fenetre = self._fenetre()
-        # La boucle est la même quel que soit le nombre d'opérations ; on en
-        # garde quelques-unes pour que le test reste rapide.
-        operations = self.analyzer.get_vision_operations()[:5]
-        fenetre.marches_analyzer = _AnalyzerRestreint(self.analyzer, operations)
-
         with unittest.mock.patch.object(
             W.QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: destination)
         ):
-            fenetre.regenerer_tous_les_suivis()
+            fenetre._ecrire_suivis(self._choix(codes))
 
         produits = glob.glob(os.path.join(destination, "*.xlsx"))
-        self.assertEqual(len(produits), len(operations))
-        self.assertIn("Régénération terminée", self._titres())
-        for operation in operations:
+        self.assertEqual(len(produits), len(codes))
+        self.assertIn("Export terminé", self._titres())
+        for code in codes:
             self.assertIn(
-                os.path.join(destination, f"suivi_financier_{operation['operation']}.xlsx"),
-                produits,
+                os.path.join(destination, f"suivi_financier_{code}.xlsx"), produits
             )
+
+    def test_une_seule_operation_vers_un_fichier_nomme(self):
+        import PyQt5.QtWidgets as W
+
+        code = self._codes(1)[0]
+        chemin = os.path.join(self.repertoire, "ailleurs.xlsx")
+
+        fenetre = self._fenetre()
+        with unittest.mock.patch.object(
+            W.QFileDialog, "getSaveFileName", staticmethod(lambda *a, **k: (chemin, ""))
+        ):
+            fenetre._ecrire_suivis(self._choix([code]))
+
+        self.assertTrue(os.path.exists(chemin))
+        self.assertEqual(self._titres(), ["Export réussi"])
 
     def test_une_operation_en_echec_est_signalee_sans_interrompre(self):
         import PyQt5.QtWidgets as W
 
         destination = os.path.join(self.repertoire, "exports")
         os.makedirs(destination)
+        codes = self._codes(3)
+        en_echec = codes[1]
 
-        operations = self.analyzer.get_vision_operations()[:3]
-        restreint = _AnalyzerRestreint(self.analyzer, operations)
-        en_echec = operations[1]["operation"]
-
-        export_reel = restreint.export_suivi_financier_operation
+        export_reel = self.analyzer.export_suivi_financier_operation
 
         def export_capricieux(code_operation, filepath, **kwargs):
             if code_operation == en_echec:
                 raise RuntimeError("export impossible")
             return export_reel(code_operation, filepath, **kwargs)
 
-        restreint.export_suivi_financier_operation = export_capricieux
         fenetre = self._fenetre()
-        fenetre.marches_analyzer = restreint
+        self.analyzer.export_suivi_financier_operation = export_capricieux
+        self.addCleanup(
+            setattr, self.analyzer, "export_suivi_financier_operation", export_reel
+        )
 
         with unittest.mock.patch.object(
             W.QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: destination)
         ):
-            fenetre.regenerer_tous_les_suivis()
+            fenetre._ecrire_suivis(self._choix(codes))
 
         # Les deux autres sont bien produites, et l'échec est nommé.
         self.assertEqual(len(glob.glob(os.path.join(destination, "*.xlsx"))), 2)
@@ -450,9 +493,147 @@ class TestRegenerationDepuisInterface(BaseTestInterface):
         with unittest.mock.patch.object(
             W.QFileDialog, "getExistingDirectory", staticmethod(lambda *a, **k: "")
         ):
-            fenetre.regenerer_tous_les_suivis()
+            fenetre._ecrire_suivis(self._choix(self._codes(3)))
 
         self.assertEqual(self.messages, [])
+
+    def test_annuler_le_dialogue_n_ecrit_rien(self):
+        import export_suivi_dialog
+
+        fenetre = self._fenetre()
+
+        class DialogueRefuse:
+            def __init__(self, **kwargs):
+                pass
+
+            def exec_(self):
+                from PyQt5.QtWidgets import QDialog
+                return QDialog.Rejected
+
+        with unittest.mock.patch.object(
+            export_suivi_dialog, "ExportSuiviFinancierDialog", DialogueRefuse
+        ):
+            fenetre.exporter_suivi_financier()
+
+        self.assertEqual(self.messages, [])
+
+    def test_portee_lue_depuis_le_tableau(self):
+        """La sélection et le filtre du bandeau alimentent la fenêtre de choix."""
+        from PyQt5.QtCore import QItemSelectionModel
+
+        fenetre = self._fenetre()
+        toutes = [op["operation"] for op in self.analyzer.get_vision_operations()]
+
+        self.assertEqual(fenetre._operations_selectionnees(), [])
+        self.assertEqual(fenetre._operations_visibles(), toutes)
+
+        cible = toutes[2]
+        fenetre.operations_proxy.setOperationFilter(cible)
+        visibles = fenetre._operations_visibles()
+        self.assertIn(cible, visibles)
+        self.assertLess(len(visibles), len(toutes))
+
+        fenetre.table_operations.selectionModel().select(
+            fenetre.operations_proxy.index(0, 0),
+            QItemSelectionModel.Select | QItemSelectionModel.Rows,
+        )
+        self.assertEqual(fenetre._operations_selectionnees(), [visibles[0]])
+
+    def test_les_options_du_dialogue_atteignent_l_export(self):
+        """Exercice, tri et journal ne sont plus réservés à une opération."""
+        import export_suivi_dialog
+
+        code = self._codes(1)[0]
+        exercices = self.analyzer.exercices_disponibles()
+        exercice = next(e for e in exercices if e != "Tous")
+        recus = {}
+
+        export_reel = self.analyzer.export_suivi_financier_operation
+
+        def export_espion(code_operation, filepath, **kwargs):
+            recus.update(kwargs)
+            recus["operation"] = code_operation
+            return True
+
+        self.analyzer.export_suivi_financier_operation = export_espion
+        self.addCleanup(
+            setattr, self.analyzer, "export_suivi_financier_operation", export_reel
+        )
+
+        fenetre = self._fenetre()
+        choix = self._choix(
+            [code], exercice=exercice, trier_par_bdc=True, journal=True
+        )
+
+        import PyQt5.QtWidgets as W
+        with unittest.mock.patch.object(
+            W.QFileDialog, "getSaveFileName",
+            staticmethod(lambda *a, **k: (os.path.join(self.repertoire, "x.xlsx"), "")),
+        ):
+            fenetre._ecrire_suivis(choix)
+
+        self.assertEqual(recus["operation"], code)
+        self.assertEqual(recus["exercice_filter"], exercice)
+        self.assertTrue(recus["trier_par_bdc"])
+        self.assertTrue(recus["journal"])
+
+
+class TestDialogueExport(BaseTestInterface):
+    """Ce que la fenêtre de choix propose, et ce qu'elle en conclut."""
+
+    def _dialogue(self, selection=(), filtrees=("A", "B", "C"), toutes=("A", "B", "C"),
+                  exercices=("Tous", "2024", "2025")):
+        from export_suivi_dialog import ExportSuiviFinancierDialog
+
+        dialogue = ExportSuiviFinancierDialog(
+            selection=selection, filtrees=filtrees, toutes=toutes, exercices=exercices
+        )
+        self.addCleanup(dialogue.deleteLater)
+        return dialogue
+
+    def test_la_selection_l_emporte_quand_il_y_en_a_une(self):
+        from export_suivi_dialog import PORTEE_SELECTION
+
+        dialogue = self._dialogue(selection=("B",))
+        self.assertEqual(dialogue.portee(), PORTEE_SELECTION)
+        self.assertEqual(dialogue.choix().operations, ["B"])
+
+    def test_sans_selection_ni_filtre_toutes_les_operations(self):
+        from export_suivi_dialog import PORTEE_TOUTES
+
+        dialogue = self._dialogue()
+        self.assertEqual(dialogue.portee(), PORTEE_TOUTES)
+        self.assertEqual(dialogue.choix().operations, ["A", "B", "C"])
+
+    def test_un_filtre_actif_est_propose_et_retenu(self):
+        """« Tout régénérer » ignorait le filtre du bandeau."""
+        from export_suivi_dialog import PORTEE_FILTREES
+
+        dialogue = self._dialogue(filtrees=("B",))
+        self.assertEqual(dialogue.portee(), PORTEE_FILTREES)
+        self.assertEqual(dialogue.choix().operations, ["B"])
+
+    def test_sans_filtre_le_choix_filtre_n_est_pas_propose(self):
+        dialogue = self._dialogue()
+        self.assertFalse(dialogue._bouton_filtrees.isEnabled())
+
+    def test_selection_vide_non_selectionnable(self):
+        dialogue = self._dialogue()
+        self.assertFalse(dialogue._bouton_selection.isEnabled())
+
+    def test_exercice_tous_ne_filtre_pas(self):
+        dialogue = self._dialogue()
+        self.assertIsNone(dialogue.choix().exercice)
+
+    def test_exercice_choisi_transmis(self):
+        dialogue = self._dialogue()
+        dialogue._exercice.setCurrentText("2025")
+        self.assertEqual(dialogue.choix().exercice, "2025")
+
+    def test_options_de_presentation_decochees_par_defaut(self):
+        choix = self._dialogue().choix()
+        self.assertFalse(choix.trier_par_bdc)
+        self.assertFalse(choix.journal)
 
 
 if __name__ == "__main__":
