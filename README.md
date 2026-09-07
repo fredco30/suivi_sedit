@@ -171,6 +171,18 @@ qui rassemble les enveloppes restant à saisir. Une opération sans enveloppe
 apparaît en gris : son pourcentage consommé vaut 0, et elle passait au vert
 « peu consommé » alors que rien n'est calculé.
 
+Le bouton d'export **annonce sa portée** : `📊 Exporter 2020_11` quand une
+ligne est sélectionnée, `📊 Exporter 4 opérations` pour plusieurs,
+`📊 Exporter les 12 filtrées` quand un filtre restreint la liste, et
+`📊 Exporter les 77 opérations` sinon. Rien ne disait auparavant qu'il agissait
+sur la sélection ; il s'accorde maintenant à ce que la fenêtre de choix
+proposera par défaut, et se met à jour à chaque sélection ou filtre.
+
+Le **clic droit** sur une ligne ouvre l'export en première action et nomme la
+destination du double-clic (`📜 Voir 2020_11 dans l'historique`) — cette
+destination ne s'apprenait autrement qu'en essayant. Viser une ligne non
+sélectionnée la sélectionne d'abord.
+
 Le champ de recherche du bandeau porte sur le **code opération, les codes de
 lot, le libellé et le titulaire** — il ne connaissait que le code opération,
 alors que le tableau affiche les trois autres. Chercher un code de lot trouve

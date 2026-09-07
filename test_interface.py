@@ -375,6 +375,12 @@ class TestExportDepuisInterface(BaseTestInterface):
             _rendre_compte_export = module.MainWindow._rendre_compte_export
             _operations_selectionnees = module.MainWindow._operations_selectionnees
             _operations_visibles = module.MainWindow._operations_visibles
+            libelle_bouton_export = module.MainWindow.libelle_bouton_export
+            actualiser_bouton_export = module.MainWindow.actualiser_bouton_export
+            voir_operation_dans_historique = (
+                module.MainWindow.voir_operation_dans_historique
+            )
+            on_operation_double_clicked = module.MainWindow.on_operation_double_clicked
 
         fenetre = FenetreDeTest()
         fenetre.db = self.db
@@ -516,6 +522,152 @@ class TestExportDepuisInterface(BaseTestInterface):
             fenetre.exporter_suivi_financier()
 
         self.assertEqual(self.messages, [])
+
+    def test_le_bouton_annonce_la_portee(self):
+        """Le bouton était muet : rien ne disait qu'il agissait sur la sélection."""
+        from PyQt5.QtCore import QItemSelectionModel
+        from PyQt5.QtWidgets import QPushButton
+
+        module = _module_application()
+        fenetre = self._fenetre()
+        fenetre.btn_export_suivi = QPushButton(fenetre)
+        toutes = [op["operation"] for op in self.analyzer.get_vision_operations()]
+
+        # Sans sélection ni filtre : la portée est l'ensemble, et le bouton le dit.
+        fenetre.actualiser_bouton_export()
+        self.assertEqual(
+            fenetre.btn_export_suivi.text(), f"📊 Exporter les {len(toutes)} opérations"
+        )
+
+        # Un filtre qui ne laisse qu'une opération la nomme.
+        fenetre.operations_proxy.setOperationFilter(toutes[3])
+        self.assertIn(toutes[3], fenetre.libelle_bouton_export())
+
+        # Un filtre plus large les compte.
+        fenetre.operations_proxy.setOperationFilter("20")
+        visibles = fenetre._operations_visibles()
+        if 1 < len(visibles) < len(toutes):
+            self.assertEqual(
+                fenetre.libelle_bouton_export(),
+                f"📊 Exporter les {len(visibles)} filtrées",
+            )
+
+        # La sélection l'emporte sur le filtre, comme dans la fenêtre de choix.
+        fenetre.operations_proxy.setOperationFilter("")
+        selection = fenetre.table_operations.selectionModel()
+        selection.select(
+            fenetre.operations_proxy.index(0, 0),
+            QItemSelectionModel.Select | QItemSelectionModel.Rows,
+        )
+        self.assertEqual(
+            fenetre.libelle_bouton_export(), f"📊 Exporter {toutes[0]}"
+        )
+        selection.select(
+            fenetre.operations_proxy.index(1, 0),
+            QItemSelectionModel.Select | QItemSelectionModel.Rows,
+        )
+        self.assertEqual(fenetre.libelle_bouton_export(), "📊 Exporter 2 opérations")
+
+        # Sur la vraie fenêtre, le libellé se remet à jour tout seul.
+        self.assertEqual(module.LIBELLE_EXPORT_GENERIQUE, "📊 Exporter le suivi financier")
+
+    def test_menu_contextuel_nomme_ses_deux_actions(self):
+        """Le clic droit annonce l'export et la destination du double-clic."""
+        module = _module_application()
+        fenetre = self._fenetre()
+        fenetre.menu_contextuel_operations = (
+            module.MainWindow.menu_contextuel_operations.__get__(fenetre)
+        )
+
+        menus = []
+
+        class MenuEspion:
+            def __init__(self, parent=None):
+                self.intitules = []
+                menus.append(self)
+
+            def addAction(self, texte):
+                self.intitules.append(texte)
+                return unittest.mock.MagicMock()
+
+            def addSeparator(self):
+                pass
+
+            def exec_(self, position):
+                pass
+
+        code = self.analyzer.get_vision_operations()[2]["operation"]
+        position = fenetre.table_operations.visualRect(
+            fenetre.operations_proxy.index(2, 0)
+        ).center()
+
+        with unittest.mock.patch.object(module, "QMenu", MenuEspion):
+            fenetre.menu_contextuel_operations(position)
+
+        self.assertEqual(len(menus), 1)
+        intitules = menus[0].intitules
+        self.assertTrue(intitules[0].startswith("📊 Exporter"), intitules)
+        self.assertTrue(intitules[0].endswith("…"), intitules)
+        self.assertIn(f"📜 Voir {code} dans l'historique", intitules)
+
+    def test_clic_droit_selectionne_la_ligne_visee(self):
+        """Viser une ligne non sélectionnée la prend, comme partout ailleurs."""
+        module = _module_application()
+        fenetre = self._fenetre()
+        fenetre.menu_contextuel_operations = (
+            module.MainWindow.menu_contextuel_operations.__get__(fenetre)
+        )
+        code = self.analyzer.get_vision_operations()[1]["operation"]
+        position = fenetre.table_operations.visualRect(
+            fenetre.operations_proxy.index(1, 0)
+        ).center()
+
+        class MenuMuet:
+            def __init__(self, parent=None):
+                pass
+
+            def addAction(self, texte):
+                return unittest.mock.MagicMock()
+
+            def addSeparator(self):
+                pass
+
+            def exec_(self, position):
+                pass
+
+        self.assertEqual(fenetre._operations_selectionnees(), [])
+        with unittest.mock.patch.object(module, "QMenu", MenuMuet):
+            fenetre.menu_contextuel_operations(position)
+        self.assertEqual(fenetre._operations_selectionnees(), [code])
+
+    def test_double_clic_et_menu_mènent_au_même_historique(self):
+        """Les deux chemins passent par la même méthode."""
+        fenetre = self._fenetre()
+        fenetre.tabs = unittest.mock.MagicMock()
+        fenetre.tabs.count.return_value = 0
+        fenetre.edit_filtre_historique = unittest.mock.MagicMock()
+
+        multi = next(
+            (op for op in self.analyzer.get_vision_operations() if op["nb_lots"] > 1),
+            None,
+        )
+        mono = next(
+            op for op in self.analyzer.get_vision_operations() if op["nb_lots"] == 1
+        )
+
+        # Un seul marché : on filtre sur le marché lui-même.
+        fenetre.voir_operation_dans_historique(mono)
+        fenetre.edit_filtre_historique.setText.assert_called_with(mono["marches"][0])
+
+        # Plusieurs lots : on filtre sur le code opération, qui les préfixe tous.
+        if multi is not None:
+            fenetre.voir_operation_dans_historique(multi)
+            fenetre.edit_filtre_historique.setText.assert_called_with(multi["operation"])
+
+        # Le double-clic emprunte le même chemin.
+        fenetre.edit_filtre_historique.reset_mock()
+        fenetre.on_operation_double_clicked(fenetre.operations_proxy.index(0, 0))
+        self.assertTrue(fenetre.edit_filtre_historique.setText.called)
 
     def test_portee_lue_depuis_le_tableau(self):
         """La sélection et le filtre du bandeau alimentent la fenêtre de choix."""

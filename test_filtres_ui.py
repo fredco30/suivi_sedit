@@ -423,6 +423,125 @@ class TestFiltreFournisseurMultiSelection(BaseTestFenetre):
         self.assertEqual(self.win.synth_proxy.rowCount(), avant)
 
 
+class TestBoutonExportSurLaVraieFenetre(BaseTestFenetre):
+    """Le libellé du bouton se met à jour tout seul, sur la fenêtre réelle.
+
+    `test_interface.py` vérifie ce que le libellé *dit* ; ici on vérifie qu'il
+    est bien *rebranché* sur les signaux de la vraie fenêtre — un libellé juste
+    mais figé serait pire que muet.
+
+    Le tableau des opérations est vide tant que « Actualiser les données » n'a
+    pas été cliqué (relecture de tous les exports SEDIT). On l'alimente donc
+    avec quelques lignes fabriquées : ce qui est éprouvé ici, ce sont les
+    branchements de la fenêtre, pas la justesse des données.
+    """
+
+    OPERATIONS = [
+        {"operation": "T_ALPHA", "nb_lots": 1, "marches": ["T_ALPHA"],
+         "libelle": "Essai alpha", "fournisseur": "ENTREPRISE A",
+         "provenance_enveloppe": "base", "montant_initial_total": 1000.0,
+         "service_fait_total": 0.0, "paye_total": 0.0, "reste_a_realiser": 1000.0,
+         "reste_a_mandater": 0.0, "pourcent_consomme": 0.0, "nb_avenants_total": 0},
+        {"operation": "T_BETA", "nb_lots": 2, "marches": ["T_BETA_1", "T_BETA_2"],
+         "libelle": "Essai beta", "fournisseur": "ENTREPRISE B",
+         "provenance_enveloppe": "sedit", "montant_initial_total": 2000.0,
+         "service_fait_total": 0.0, "paye_total": 0.0, "reste_a_realiser": 2000.0,
+         "reste_a_mandater": 0.0, "pourcent_consomme": 0.0, "nb_avenants_total": 0},
+        {"operation": "T_GAMMA", "nb_lots": 1, "marches": ["T_GAMMA"],
+         "libelle": "Essai gamma", "fournisseur": "ENTREPRISE C",
+         "provenance_enveloppe": "absente", "montant_initial_total": 0.0,
+         "service_fait_total": 0.0, "paye_total": 0.0, "reste_a_realiser": 0.0,
+         "reste_a_mandater": 0.0, "pourcent_consomme": 0.0, "nb_avenants_total": 0},
+    ]
+
+    def setUp(self):
+        self._lignes_initiales = list(self.win.operations_model.rows)
+        self.win.operations_model.set_data(list(self.OPERATIONS))
+        self._laisser_respirer()
+
+    def tearDown(self):
+        self.win.edit_filtre_operation.clear()
+        self.win.table_operations.clearSelection()
+        self.win.operations_model.set_data(self._lignes_initiales)
+        self._laisser_respirer()
+        super().tearDown()
+
+    def test_le_libelle_suit_le_filtre(self):
+        depart = self.win.btn_export_suivi.text()
+        self.assertEqual(depart, "📊 Exporter les 3 opérations")
+
+        # Un filtre qui ne laisse qu'une opération la nomme.
+        self.win.edit_filtre_operation.setText("T_BETA")
+        self._laisser_respirer()
+        self.assertEqual(self.win.btn_export_suivi.text(), "📊 Exporter T_BETA")
+
+        # Un filtre plus large les compte.
+        self.win.edit_filtre_operation.setText("ENTREPRISE")
+        self._laisser_respirer()
+        self.assertEqual(self.win.btn_export_suivi.text(), "📊 Exporter les 3 opérations")
+
+        self.win.edit_filtre_operation.setText("T_")
+        self._laisser_respirer()
+        self.assertEqual(self.win.btn_export_suivi.text(), "📊 Exporter les 3 opérations")
+
+        self.win.edit_filtre_operation.clear()
+        self._laisser_respirer()
+        self.assertEqual(self.win.btn_export_suivi.text(), depart)
+
+    def test_le_libelle_suit_la_selection(self):
+        from PyQt5.QtCore import QItemSelectionModel
+
+        depart = self.win.btn_export_suivi.text()
+        selection = self.win.table_operations.selectionModel()
+
+        # Le tableau est triable : la ligne 0 du proxy n'est pas forcément la
+        # première du modèle. On lit ce qui s'y trouve vraiment.
+        def _code_a_la_ligne(ligne):
+            source = self.win.operations_proxy.mapToSource(
+                self.win.operations_proxy.index(ligne, 0)
+            )
+            return self.win.operations_model.rows[source.row()]["operation"]
+
+        premier = _code_a_la_ligne(0)
+        selection.select(
+            self.win.operations_proxy.index(0, 0),
+            QItemSelectionModel.Select | QItemSelectionModel.Rows,
+        )
+        self._laisser_respirer()
+        self.assertEqual(self.win.btn_export_suivi.text(), f"📊 Exporter {premier}")
+
+        selection.select(
+            self.win.operations_proxy.index(1, 0),
+            QItemSelectionModel.Select | QItemSelectionModel.Rows,
+        )
+        self._laisser_respirer()
+        self.assertEqual(self.win.btn_export_suivi.text(), "📊 Exporter 2 opérations")
+
+        # La sélection l'emporte sur le filtre, comme dans la fenêtre de choix.
+        self.win.edit_filtre_operation.setText("T_ALPHA")
+        self._laisser_respirer()
+        self.assertIn("Exporter", self.win.btn_export_suivi.text())
+
+        self.win.edit_filtre_operation.clear()
+        self.win.table_operations.clearSelection()
+        self._laisser_respirer()
+        self.assertEqual(self.win.btn_export_suivi.text(), depart)
+
+    def test_le_tableau_accepte_le_clic_droit_et_la_selection_multiple(self):
+        from PyQt5.QtCore import Qt
+        from PyQt5.QtWidgets import QAbstractItemView
+
+        self.assertEqual(
+            self.win.table_operations.contextMenuPolicy(), Qt.CustomContextMenu
+        )
+        self.assertEqual(
+            self.win.table_operations.selectionMode(),
+            QAbstractItemView.ExtendedSelection,
+        )
+        self.assertIn("Clic droit", self.win.table_operations.toolTip())
+        self.assertIn("Double-clic", self.win.table_operations.toolTip())
+
+
 class TestDescriptionFiltresActifs(BaseTestFenetre):
     """_get_active_filters_description() doit refléter les sélections
     multiples, et ne jamais confondre "Aucun coché" avec un filtre actif."""
