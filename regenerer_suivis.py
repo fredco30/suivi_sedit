@@ -19,7 +19,7 @@ import argparse
 import os
 import sqlite3
 import sys
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from marches_module import MarchesAnalyzer
 
@@ -46,6 +46,25 @@ class BaseSuiviLectureSeule:
         return self.conn.execute(
             "SELECT * FROM marches WHERE code_marche = ?", (code_marche,)
         ).fetchone()
+
+    def get_operations_marches(self) -> Dict[str, str]:
+        """Rattachements marché → opération saisis dans l'application.
+
+        Le traitement en lot regroupe donc les lots comme l'écran, y compris
+        les codifications que la règle automatique ne sait pas lire. La table
+        peut manquer d'une base antérieure : on rend alors un relevé vide.
+        """
+        try:
+            lignes = self.conn.execute(
+                "SELECT code_marche, code_operation FROM operations_marches"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {}
+        return {
+            str(ligne["code_marche"]).strip(): str(ligne["code_operation"]).strip()
+            for ligne in lignes
+            if ligne["code_marche"] and ligne["code_operation"]
+        }
 
     def get_tranches(self, code_marche: str) -> List[sqlite3.Row]:
         return list(self.conn.execute(

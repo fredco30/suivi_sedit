@@ -7,6 +7,8 @@ from PyQt5.QtGui import QBrush, QColor
 from datetime import datetime, date
 from typing import List, Dict
 
+from operations_marches import lot_isole
+
 
 # ============== COLONNES POUR LA VISION GLOBALE ==============
 
@@ -49,6 +51,14 @@ PROVENANCES_ENVELOPPE = {
     "absente": ("⚠ non saisie", "Aucune enveloppe : le solde de cette opération "
                                 "n'est pas calculable."),
 }
+
+
+def _lot_unique_facture(row_data) -> bool:
+    """L'opération n'a qu'un lot, mais son code marché en annonce d'autres."""
+    marches = row_data.get("marches") or []
+    if not isinstance(marches, list) or len(marches) != 1:
+        return False
+    return lot_isole(marches[0], row_data.get("operation", ""), marches)
 
 
 OPERATIONS_COLUMNS = [
@@ -460,6 +470,12 @@ class OperationsTableModel(QAbstractTableModel):
 
             # Formatage du nombre de lots
             if key == "nb_lots":
+                # « 1 » se lit « opération à lot unique ». Quand le code du
+                # marché annonce un lot (2020_24_7 pour 2020_24), c'est en
+                # réalité « un seul lot facturé » : les frères existent
+                # peut-être, sans écriture dans les exports SEDIT.
+                if _lot_unique_facture(row_data):
+                    return "1 ?"
                 return str(value) if value else "1"
 
             # Formatage des marchés (liste)
@@ -488,6 +504,13 @@ class OperationsTableModel(QAbstractTableModel):
                 provenance = row_data.get("provenance_enveloppe")
                 if provenance in PROVENANCES_ENVELOPPE:
                     return PROVENANCES_ENVELOPPE[provenance][1]
+            if key == "nb_lots" and _lot_unique_facture(row_data):
+                marche = row_data.get("marches", [""])[0]
+                return (
+                    f"Un seul lot facturé : {marche}.\n"
+                    f"L'opération {row_data.get('operation', '')} en compte "
+                    "peut-être d'autres, sans écriture dans les exports SEDIT."
+                )
 
         if role == Qt.TextAlignmentRole:
             # Alignement à droite pour les montants et pourcentages

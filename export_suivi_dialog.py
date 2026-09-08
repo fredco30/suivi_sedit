@@ -31,8 +31,12 @@ PORTEE_TOUTES = "toutes"
 EXERCICE_TOUS = "Tous"
 
 
-def _designer(operations: Sequence[str], si_vide: str) -> str:
-    """Nomme l'opération quand il n'y en a qu'une, les compte au-delà."""
+def designer_operations(operations: Sequence[str], si_vide: str) -> str:
+    """Nomme l'opération quand il n'y en a qu'une, les compte au-delà.
+
+    Partagé avec le libellé du bouton de l'onglet Opérations, pour que le
+    bouton et la fenêtre désignent la même portée dans les mêmes termes.
+    """
     if not operations:
         return si_vide
     if len(operations) == 1:
@@ -91,7 +95,7 @@ class ExportSuiviFinancierDialog(QDialog):
         selectionnees = self._portees[PORTEE_SELECTION]
         self._bouton_selection = _ajouter(
             PORTEE_SELECTION,
-            "La sélection — " + _designer(selectionnees, "aucune ligne sélectionnée"),
+            "La sélection — " + designer_operations(selectionnees, "aucune ligne sélectionnée"),
             actif=bool(selectionnees),
         )
 
@@ -101,7 +105,7 @@ class ExportSuiviFinancierDialog(QDialog):
         filtre_actif = 0 < len(operations_filtrees) < len(self._portees[PORTEE_TOUTES])
         self._bouton_filtrees = _ajouter(
             PORTEE_FILTREES,
-            "Le filtre en cours — " + _designer(operations_filtrees, "aucune opération"),
+            "Le filtre en cours — " + designer_operations(operations_filtrees, "aucune opération"),
             actif=filtre_actif,
         )
         self._bouton_filtrees.setVisible(filtre_actif)

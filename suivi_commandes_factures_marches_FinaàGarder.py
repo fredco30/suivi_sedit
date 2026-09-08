@@ -17,6 +17,9 @@ from marches_models import (
 )
 from marches_dialogs import EditMarcheDialog
 
+# Libellé du bouton d'export quand aucune portée particulière ne se dégage.
+LIBELLE_EXPORT_GENERIQUE = "📊 Exporter le suivi financier"
+
 from PyQt5.QtCore import (
     Qt,
     QAbstractTableModel,
@@ -768,6 +771,20 @@ class Database:
             cur.execute("ALTER TABLE commande_diagnostic ADD COLUMN dismissed_until TEXT")
             self.conn.commit()
 
+        # Rattachement d'un marché à son opération, quand la codification ne
+        # permet pas de le déduire. La table est vide par défaut : tant que
+        # rien n'y est saisi, le regroupement reste exactement celui de la
+        # règle automatique.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operations_marches (
+                code_marche TEXT PRIMARY KEY,
+                code_operation TEXT NOT NULL,
+                last_update TEXT
+            )
+            """
+        )
+
         self.conn.commit()
 
     # -------------- Config --------------
@@ -777,6 +794,37 @@ class Database:
         cur.execute("SELECT value FROM config WHERE key = ?", (key,))
         row = cur.fetchone()
         return row["value"] if row else default
+
+    def get_operations_marches(self):
+        """Rattachements marché → opération saisis à la main.
+
+        Vide tant que personne n'a arbitré : la règle automatique décide seule.
+        """
+        cur = self.conn.cursor()
+        cur.execute("SELECT code_marche, code_operation FROM operations_marches")
+        return {
+            str(row["code_marche"]).strip(): str(row["code_operation"]).strip()
+            for row in cur.fetchall()
+            if row["code_marche"] and row["code_operation"]
+        }
+
+    def set_operation_marche(self, code_marche, code_operation):
+        """Rattache un marché à une opération ; une valeur vide efface le rattachement."""
+        code_marche = str(code_marche or "").strip()
+        if not code_marche:
+            return
+        cur = self.conn.cursor()
+        code_operation = str(code_operation or "").strip()
+        if not code_operation:
+            cur.execute("DELETE FROM operations_marches WHERE code_marche = ?", (code_marche,))
+        else:
+            cur.execute(
+                "INSERT INTO operations_marches(code_marche, code_operation, last_update) "
+                "VALUES(?, ?, ?) ON CONFLICT(code_marche) DO UPDATE SET "
+                "code_operation=excluded.code_operation, last_update=excluded.last_update",
+                (code_marche, code_operation, datetime.now().isoformat(timespec="seconds")),
+            )
+        self.conn.commit()
 
     def set_config(self, key, value):
         cur = self.conn.cursor()
@@ -2860,6 +2908,30 @@ class MainWindow(QMainWindow):
         header_operations_layout.addWidget(label_operations)
         header_operations_layout.addStretch()
 
+        # Le regroupement se déduit du code marché ; certaines codifications
+        # lui échappent et se corrigent ici, une fois pour toutes.
+        self.btn_rattachements = QPushButton("🔗 Rattacher les marchés")
+        self.btn_rattachements.setToolTip(
+            "Dire à quelle opération appartient un marché que la codification\n"
+            "ne permet pas de rattacher (MC157_01 et MC157_02, 2020_14G1 à GO…).\n"
+            "Tant que rien n'est saisi, le regroupement actuel ne change pas."
+        )
+        self.btn_rattachements.clicked.connect(self.rattacher_marches_operations)
+        self.btn_rattachements.setStyleSheet("""
+            QPushButton {
+                background-color: #6f42c1;
+                color: white;
+                border: none;
+                padding: 5px 15px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5a32a3;
+            }
+        """)
+        header_operations_layout.addWidget(self.btn_rattachements)
+
         operations_layout.addWidget(header_operations)
 
         # Filtre
@@ -2883,10 +2955,11 @@ class MainWindow(QMainWindow):
 
         # Un seul bouton : la portée (sélection, filtre, tout) et les options
         # se choisissent dans la fenêtre qu'il ouvre.
-        self.btn_export_suivi = QPushButton("📊 Exporter le suivi financier")
-        self.btn_export_suivi.setMaximumWidth(230)
+        self.btn_export_suivi = QPushButton(LIBELLE_EXPORT_GENERIQUE)
+        self.btn_export_suivi.setMinimumWidth(230)
         self.btn_export_suivi.setToolTip(
-            "Exporter la sélection, les opérations filtrées ou toutes les opérations."
+            "Exporter la sélection, les opérations filtrées ou toutes les opérations.\n"
+            "Le libellé annonce ce qui partira si vous validez sans rien changer."
         )
         self.btn_export_suivi.setStyleSheet("""
             QPushButton {
@@ -2925,6 +2998,29 @@ class MainWindow(QMainWindow):
 
         # Connecter le double-clic pour afficher l'historique de l'opération
         self.table_operations.doubleClicked.connect(self.on_operation_double_clicked)
+        self.table_operations.setToolTip(
+            "Clic droit : exporter le suivi financier.\n"
+            "Double-clic : ouvrir l'opération dans l'onglet Historique.\n"
+            "Ctrl ou Maj : sélectionner plusieurs opérations."
+        )
+        self.table_operations.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table_operations.customContextMenuRequested.connect(
+            self.menu_contextuel_operations
+        )
+
+        # Le bouton d'export annonce la portée que la fenêtre proposera par
+        # défaut : elle dépend de la sélection et du filtre, qui changent tous
+        # les deux sans que le bouton soit touché.
+        self.table_operations.selectionModel().selectionChanged.connect(
+            self.actualiser_bouton_export
+        )
+        # `invalidateFilter` retire et insère des lignes sans émettre
+        # layoutChanged : sans rowsInserted/rowsRemoved, le libellé restait
+        # figé sur le nombre total quand on tapait dans le champ de recherche.
+        self.operations_proxy.layoutChanged.connect(self.actualiser_bouton_export)
+        self.operations_proxy.modelReset.connect(self.actualiser_bouton_export)
+        self.operations_proxy.rowsInserted.connect(self.actualiser_bouton_export)
+        self.operations_proxy.rowsRemoved.connect(self.actualiser_bouton_export)
 
         header_operations_table = self.table_operations.horizontalHeader()
         header_operations_table.setDefaultAlignment(Qt.AlignCenter)
@@ -5985,29 +6081,86 @@ class MainWindow(QMainWindow):
 
     def on_operation_double_clicked(self, index):
         """Appelée lors d'un double-clic sur une opération."""
-        # Récupérer l'opération depuis le modèle source
         source_index = self.operations_proxy.mapToSource(index)
-        if source_index.row() < len(self.operations_model.rows):
+        if 0 <= source_index.row() < len(self.operations_model.rows):
+            self.voir_operation_dans_historique(
+                self.operations_model.rows[source_index.row()]
+            )
+
+    def voir_operation_dans_historique(self, operation_data):
+        """Bascule vers l'onglet Historique, filtré sur cette opération.
+
+        Le double-clic mène ici ; le menu contextuel l'annonce en clair, faute
+        de quoi la destination du double-clic ne s'apprend qu'en l'essayant.
+        """
+        code_operation = operation_data.get('operation', '')
+        if not code_operation:
+            return
+        marches = operation_data.get('marches', [])
+
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == "📜 Historique":
+                self.tabs.setCurrentIndex(i)
+                break
+
+        # Un seul marché : filtrer dessus. Plusieurs lots : filtrer sur le code
+        # de l'opération, qui les préfixe tous.
+        if isinstance(marches, list) and len(marches) == 1:
+            self.edit_filtre_historique.setText(marches[0])
+        else:
+            self.edit_filtre_historique.setText(code_operation)
+
+    def libelle_bouton_export(self):
+        """Ce que le bouton d'export annonce, selon la sélection et le filtre.
+
+        Le bouton était muet : rien ne disait qu'il agissait sur la ligne
+        sélectionnée. Il nomme désormais la portée que la fenêtre proposera.
+        """
+        from export_suivi_dialog import designer_operations
+
+        selection = self._operations_selectionnees()
+        if selection:
+            return "📊 Exporter " + designer_operations(selection, "")
+
+        visibles = self._operations_visibles()
+        total = len(self.operations_model.rows)
+        if 0 < len(visibles) < total:
+            if len(visibles) == 1:
+                return f"📊 Exporter {visibles[0]}"
+            return f"📊 Exporter les {len(visibles)} filtrées"
+        if total:
+            return f"📊 Exporter les {total} opérations"
+        return LIBELLE_EXPORT_GENERIQUE
+
+    def actualiser_bouton_export(self, *args):
+        """Remet le libellé du bouton en accord avec ce qui est affiché."""
+        if hasattr(self, "btn_export_suivi"):
+            self.btn_export_suivi.setText(self.libelle_bouton_export())
+
+    def menu_contextuel_operations(self, position):
+        """Menu du clic droit : l'export en tête, l'historique nommé."""
+        index = self.table_operations.indexAt(position)
+        modele = self.table_operations.selectionModel()
+        if index.isValid() and modele is not None and not modele.isSelected(index):
+            self.table_operations.selectRow(index.row())
+
+        menu = QMenu(self.table_operations)
+        menu.addAction(self.libelle_bouton_export() + "…").triggered.connect(
+            self.exporter_suivi_financier
+        )
+
+        source_index = self.operations_proxy.mapToSource(index)
+        if index.isValid() and 0 <= source_index.row() < len(self.operations_model.rows):
             operation_data = self.operations_model.rows[source_index.row()]
-            code_operation = operation_data.get('operation', '')
-            marches = operation_data.get('marches', [])
+            code = operation_data.get('operation', '')
+            if code:
+                menu.addSeparator()
+                menu.addAction(f"📜 Voir {code} dans l'historique").triggered.connect(
+                    lambda _=False, donnees=operation_data:
+                    self.voir_operation_dans_historique(donnees)
+                )
 
-            if not code_operation:
-                return
-
-            # Basculer vers l'onglet Historique
-            # Trouver l'index de l'onglet Historique
-            for i in range(self.tabs.count()):
-                if self.tabs.tabText(i) == "📜 Historique":
-                    self.tabs.setCurrentIndex(i)
-                    break
-
-            # Si l'opération contient un seul marché, filtrer par ce marché
-            # Sinon, filtrer par le code de l'opération (tous les marchés commençant par ce code)
-            if isinstance(marches, list) and len(marches) == 1:
-                self.edit_filtre_historique.setText(marches[0])
-            else:
-                self.edit_filtre_historique.setText(code_operation)
+        menu.exec_(self.table_operations.viewport().mapToGlobal(position))
 
     def saisir_enveloppes_marches(self):
         """Ouvre la saisie en masse des enveloppes contractuelles des marchés."""
@@ -6025,6 +6178,25 @@ class MainWindow(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             # Les enveloppes viennent de changer : les vues qui affichent un
             # solde doivent repartir des nouveaux montants.
+            self.marches_analyzer.invalider_vision()
+            self.refresh_marches_data()
+
+    def rattacher_marches_operations(self):
+        """Ouvre l'arbitrage du rattachement des marchés à leur opération."""
+        if not self.marches_analyzer:
+            QMessageBox.warning(
+                self,
+                "Données non chargées",
+                "Veuillez d'abord charger les données en cliquant sur 'Actualiser les données'."
+            )
+            return
+
+        from operations_dialog import CorrespondanceOperationsDialog
+
+        dialog = CorrespondanceOperationsDialog(self.db, self.marches_analyzer, self)
+        if dialog.exec_() == QDialog.Accepted:
+            # Le regroupement des lots vient de changer : toutes les vues qui
+            # raisonnent par opération repartent des nouveaux rattachements.
             self.marches_analyzer.invalider_vision()
             self.refresh_marches_data()
 

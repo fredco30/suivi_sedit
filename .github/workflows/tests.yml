@@ -1,6 +1,6 @@
 name: Tests
 
-# Les 193 tests ne tournaient que sur le poste de qui les lançait. Ils tournent
+# Les tests ne tournaient que sur le poste de qui les lançait. Ils tournent
 # désormais à chaque poussée et sur chaque pull request.
 on:
   push:
