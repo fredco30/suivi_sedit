@@ -92,6 +92,7 @@ class MarchesAnalyzer:
         )
         self.sync_stats = None
         self._vision_operations = None
+        self._operations_marches = None
 
     @classmethod
     def resoudre_sources(cls, excel_path) -> List[str]:
@@ -628,8 +629,8 @@ class MarchesAnalyzer:
             if montant_initial_marche > 0:
                 pourcent_consomme = (service_fait_cumule / montant_initial_marche) * 100
 
-            # Extraire le code opération
-            code_operation = self.extract_operation(marche)
+            # Rattachement saisi en base, sinon la règle de codification.
+            code_operation = self.operation_du_marche(marche)
 
             results.append({
                 'marche': marche,
@@ -705,13 +706,42 @@ class MarchesAnalyzer:
         # Sinon, le marché est l'opération complète
         return normalized
 
+    def rattachements_manuels(self) -> Dict[str, str]:
+        """Rattachements marché → opération saisis en base, mémorisés.
+
+        La table est optionnelle : une base qui ne la propose pas — un adaptateur
+        de test, une version antérieure — donne simplement un dictionnaire vide,
+        et la règle automatique décide seule.
+        """
+        if self._operations_marches is None:
+            lecteur = getattr(self.db, "get_operations_marches", None) if self.db else None
+            try:
+                self._operations_marches = dict(lecteur()) if lecteur else {}
+            except Exception as erreur:  # base ancienne, table absente…
+                print(f"[OPERATIONS] Rattachements manuels illisibles : {erreur}")
+                self._operations_marches = {}
+        return self._operations_marches
+
+    def operation_du_marche(self, marche: str) -> str:
+        """Opération d'un marché : le rattachement saisi, sinon la règle.
+
+        `extract_operation` ne peut pas deviner les codifications qui sortent du
+        schéma « … _<n° de lot> » — `MC157_01` et `MC157_02`, `2019_06P1` à
+        `P3R`, `2020_14G1` à `G5`. Un rattachement saisi en base tranche ces
+        cas une fois pour toutes ; sans lui, rien ne change.
+        """
+        code = str(marche or "").strip()
+        rattachement = self.rattachements_manuels().get(code)
+        return rattachement if rattachement else self.extract_operation(code)
+
     def invalider_vision(self):
         """Oublie la vision par opération mémorisée.
 
         À appeler après une écriture en base qui change les montants des
-        marchés (enveloppes, avenants, tranches).
+        marchés (enveloppes, avenants, tranches) ou leur rattachement.
         """
         self._vision_operations = None
+        self._operations_marches = None
 
     def get_vision_operations(self, force_refresh: bool = False) -> List[Dict]:
         """
@@ -745,7 +775,9 @@ class MarchesAnalyzer:
         operations_dict = {}
 
         for marche_data in vision_marches:
-            operation = self.extract_operation(marche_data['marche'])
+            operation = marche_data.get('operation') or self.operation_du_marche(
+                marche_data['marche']
+            )
 
             if operation not in operations_dict:
                 operations_dict[operation] = {

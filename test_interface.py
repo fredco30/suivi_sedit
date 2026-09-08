@@ -42,6 +42,9 @@ CREATE TABLE commandes (
     fournisseur TEXT, libelle TEXT, date_commande TEXT, marche TEXT,
     montant_ttc REAL, statut TEXT
 );
+CREATE TABLE operations_marches (
+    code_marche TEXT PRIMARY KEY, code_operation TEXT NOT NULL, last_update TEXT
+);
 """
 
 
@@ -91,6 +94,26 @@ class BaseFactice:
     def get_montant_total_marche(self, code_marche):
         marche = self.get_marche(code_marche)
         return float(marche["montant_initial_manuel"] or 0) if marche else 0.0
+
+    def get_operations_marches(self):
+        return {
+            row["code_marche"]: row["code_operation"]
+            for row in self.conn.execute(
+                "SELECT code_marche, code_operation FROM operations_marches")
+        }
+
+    def set_operation_marche(self, code_marche, code_operation):
+        code_operation = (code_operation or "").strip()
+        if not code_operation:
+            self.conn.execute(
+                "DELETE FROM operations_marches WHERE code_marche = ?", (code_marche,))
+        else:
+            self.conn.execute(
+                "INSERT INTO operations_marches(code_marche, code_operation, last_update) "
+                "VALUES (?, ?, datetime('now')) ON CONFLICT(code_marche) DO UPDATE SET "
+                "code_operation = excluded.code_operation, last_update = excluded.last_update",
+                (code_marche, code_operation))
+        self.conn.commit()
 
     def upsert_marche(self, code_marche, data):
         """Même sémantique que l'application : toutes les colonnes sont réécrites."""
@@ -160,6 +183,9 @@ class BaseTestInterface(unittest.TestCase):
 
         self.db = BaseFactice(self.db_path)
         self.analyzer.db = self.db
+        # L'analyzer est partagé par la classe : sans cela, les enveloppes et
+        # les rattachements du test précédent survivraient au changement de base.
+        self.analyzer.invalider_vision()
 
         self._museler_les_boites()
 
@@ -757,6 +783,35 @@ class TestOngletOperations(BaseTestInterface):
         index = self.modele.index(self._ligne(code), self._colonne(cle))
         return self.modele.data(index, role or Qt.DisplayRole)
 
+    def test_lot_unique_facture_distingue_du_lot_unique(self):
+        """« 1 » se lisait « une seule tranche » : c'est « un seul lot facturé »."""
+        from PyQt5.QtCore import Qt
+
+        # 2020_24 n'est vu que par son lot 2020_24_7 : les frères existent
+        # peut-être, sans écriture dans les exports.
+        isolees = [
+            op["operation"] for op in self.operations
+            if op["nb_lots"] == 1 and op["marches"][0] != op["operation"]
+            and op["marches"][0].startswith(op["operation"])
+        ]
+        self.assertTrue(isolees, "aucun lot isolé dans le jeu de test")
+        code = isolees[0]
+        self.assertEqual(self._affiche(code, "nb_lots"), "1 ?")
+        infobulle = self._affiche(code, "nb_lots", Qt.ToolTipRole)
+        self.assertIn("Un seul lot facturé", infobulle)
+        self.assertIn(code, infobulle)
+
+    def test_operation_a_lot_unique_reste_affichee_1(self):
+        from PyQt5.QtCore import Qt
+
+        franches = [
+            op["operation"] for op in self.operations
+            if op["nb_lots"] == 1 and op["marches"][0] == op["operation"]
+        ]
+        self.assertTrue(franches, "aucune opération à marché unique dans le jeu")
+        self.assertEqual(self._affiche(franches[0], "nb_lots"), "1")
+        self.assertIsNone(self._affiche(franches[0], "nb_lots", Qt.ToolTipRole))
+
     def test_provenance_de_l_enveloppe_affichee(self):
         """Il fallait ouvrir le fichier exporté pour savoir ce que vaut le montant."""
         from marches_models import PROVENANCES_ENVELOPPE
@@ -924,6 +979,137 @@ class TestDialogueExport(BaseTestInterface):
         choix = self._dialogue().choix()
         self.assertFalse(choix.trier_par_bdc)
         self.assertFalse(choix.journal)
+
+
+class TestDialogueRattachements(BaseTestInterface):
+    """Arbitrage du rattachement des marchés à leur opération."""
+
+    def _dialogue(self):
+        from operations_dialog import CorrespondanceOperationsDialog
+        return CorrespondanceOperationsDialog(self.db, self.analyzer)
+
+    def _saisir(self, dialogue, code, texte):
+        from operations_dialog import COL_OPERATION
+        dialogue.table.item(dialogue._ligne_du_marche(code), COL_OPERATION).setText(texte)
+
+    def test_tous_les_marches_sont_listes_avec_la_regle(self):
+        dialogue = self._dialogue()
+        self.assertEqual(dialogue.table.rowCount(), len(dialogue.fiches))
+        ligne = dialogue._ligne_du_marche("2020_14G3P")
+        self.assertIsNotNone(ligne)
+        self.assertEqual(dialogue.fiches[ligne]["regle"], "2020_14G3P")
+        self.assertEqual(dialogue.fiches[ligne]["saisi"], "")
+
+    def test_seule_la_colonne_operation_est_editable(self):
+        from PyQt5.QtCore import Qt
+        from operations_dialog import COL_MARCHE, COL_OPERATION, COL_REGLE, COL_TITULAIRE
+
+        dialogue = self._dialogue()
+        self.assertTrue(dialogue.table.item(0, COL_OPERATION).flags() & Qt.ItemIsEditable)
+        for colonne in (COL_MARCHE, COL_REGLE, COL_TITULAIRE):
+            self.assertFalse(
+                dialogue.table.item(0, colonne).flags() & Qt.ItemIsEditable,
+                f"colonne {colonne} ne doit pas être éditable",
+            )
+
+    def test_les_codes_voisins_sont_signales(self):
+        """2020_14G1 à GO forment sept opérations : c'est le cas à arbitrer."""
+        dialogue = self._dialogue()
+        a_arbitrer = {f["marche"] for f in dialogue.fiches if dialogue._a_arbitrer(f)}
+        self.assertIn("2020_14G3P", a_arbitrer)
+        self.assertIn("2020_14G1", a_arbitrer)
+        # Une souche qui ne porte qu'une opération n'appelle aucun arbitrage.
+        solitaires = [
+            f["marche"] for f in dialogue.fiches
+            if not dialogue._a_arbitrer(f)
+        ]
+        self.assertTrue(solitaires)
+
+    def test_rattachement_saisi_enregistre_et_relu(self):
+        dialogue = self._dialogue()
+        self._saisir(dialogue, "2020_14G3P", "2020_14")
+        self.assertEqual(dialogue.rattachements()["2020_14G3P"], "2020_14")
+
+        dialogue.save()
+        self.assertEqual(self.db.get_operations_marches()["2020_14G3P"], "2020_14")
+
+        # L'analyzer repart de la base : le marché change d'opération.
+        self.assertEqual(self.analyzer.operation_du_marche("2020_14G3P"), "2020_14")
+
+    def test_champ_vide_efface_le_rattachement(self):
+        self.db.set_operation_marche("2020_14G3P", "2020_14")
+        self.analyzer.invalider_vision()
+
+        dialogue = self._dialogue()
+        ligne = dialogue._ligne_du_marche("2020_14G3P")
+        self.assertEqual(dialogue.fiches[ligne]["saisi"], "2020_14")
+
+        self._saisir(dialogue, "2020_14G3P", "")
+        dialogue.save()
+
+        self.assertNotIn("2020_14G3P", self.db.get_operations_marches())
+        self.assertEqual(self.analyzer.operation_du_marche("2020_14G3P"), "2020_14G3P")
+
+    def test_effacer_tous_les_rattachements(self):
+        self.db.set_operation_marche("2020_14G3P", "2020_14")
+        self.db.set_operation_marche("2020_14G1", "2020_14")
+        self.analyzer.invalider_vision()
+
+        dialogue = self._dialogue()
+        dialogue._effacer_rattachements()
+        self.assertEqual(dialogue.rattachements(), {})
+
+        dialogue.save()
+        self.assertEqual(self.db.get_operations_marches(), {})
+
+    def test_filtre_et_case_a_arbitrer(self):
+        dialogue = self._dialogue()
+
+        dialogue._appliquer_filtre("2020_14G3P")
+        visibles = [
+            ligne for ligne in range(dialogue.table.rowCount())
+            if not dialogue.table.isRowHidden(ligne)
+        ]
+        self.assertEqual(len(visibles), 1)
+
+        dialogue.recherche.setText("")
+        dialogue.case_a_arbitrer.setChecked(True)
+        restants = [
+            dialogue.fiches[ligne]["marche"]
+            for ligne in range(dialogue.table.rowCount())
+            if not dialogue.table.isRowHidden(ligne)
+        ]
+        self.assertIn("2020_14G3P", restants)
+        self.assertLess(len(restants), len(dialogue.fiches))
+
+    def test_regroupement_saisi_fusionne_les_lots(self):
+        """Deux marchés rattachés à la même opération n'en forment plus qu'une."""
+        avant = {op["operation"] for op in self.analyzer.get_vision_operations()}
+        self.assertIn("2020_14G3P", avant)
+        self.assertIn("2020_14G1", avant)
+
+        dialogue = self._dialogue()
+        self._saisir(dialogue, "2020_14G3P", "2020_14")
+        self._saisir(dialogue, "2020_14G1", "2020_14")
+        dialogue.save()
+
+        self.analyzer.invalider_vision()
+        apres = {
+            op["operation"]: op for op in self.analyzer.get_vision_operations()
+        }
+        self.assertNotIn("2020_14G3P", apres)
+        self.assertNotIn("2020_14G1", apres)
+        self.assertIn("2020_14", apres)
+        self.assertGreaterEqual(apres["2020_14"]["nb_lots"], 2)
+
+    def test_la_base_sans_la_table_ne_bloque_pas(self):
+        """Une base antérieure au rattachement doit rester exploitable."""
+        self.db.conn.execute("DROP TABLE operations_marches")
+        self.db.conn.commit()
+        self.analyzer.invalider_vision()
+
+        self.assertEqual(self.analyzer.rattachements_manuels(), {})
+        self.assertEqual(self.analyzer.operation_du_marche("2020_14G3P"), "2020_14G3P")
 
 
 if __name__ == "__main__":

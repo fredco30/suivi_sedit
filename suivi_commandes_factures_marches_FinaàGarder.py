@@ -771,6 +771,20 @@ class Database:
             cur.execute("ALTER TABLE commande_diagnostic ADD COLUMN dismissed_until TEXT")
             self.conn.commit()
 
+        # Rattachement d'un marché à son opération, quand la codification ne
+        # permet pas de le déduire. La table est vide par défaut : tant que
+        # rien n'y est saisi, le regroupement reste exactement celui de la
+        # règle automatique.
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operations_marches (
+                code_marche TEXT PRIMARY KEY,
+                code_operation TEXT NOT NULL,
+                last_update TEXT
+            )
+            """
+        )
+
         self.conn.commit()
 
     # -------------- Config --------------
@@ -780,6 +794,37 @@ class Database:
         cur.execute("SELECT value FROM config WHERE key = ?", (key,))
         row = cur.fetchone()
         return row["value"] if row else default
+
+    def get_operations_marches(self):
+        """Rattachements marché → opération saisis à la main.
+
+        Vide tant que personne n'a arbitré : la règle automatique décide seule.
+        """
+        cur = self.conn.cursor()
+        cur.execute("SELECT code_marche, code_operation FROM operations_marches")
+        return {
+            str(row["code_marche"]).strip(): str(row["code_operation"]).strip()
+            for row in cur.fetchall()
+            if row["code_marche"] and row["code_operation"]
+        }
+
+    def set_operation_marche(self, code_marche, code_operation):
+        """Rattache un marché à une opération ; une valeur vide efface le rattachement."""
+        code_marche = str(code_marche or "").strip()
+        if not code_marche:
+            return
+        cur = self.conn.cursor()
+        code_operation = str(code_operation or "").strip()
+        if not code_operation:
+            cur.execute("DELETE FROM operations_marches WHERE code_marche = ?", (code_marche,))
+        else:
+            cur.execute(
+                "INSERT INTO operations_marches(code_marche, code_operation, last_update) "
+                "VALUES(?, ?, ?) ON CONFLICT(code_marche) DO UPDATE SET "
+                "code_operation=excluded.code_operation, last_update=excluded.last_update",
+                (code_marche, code_operation, datetime.now().isoformat(timespec="seconds")),
+            )
+        self.conn.commit()
 
     def set_config(self, key, value):
         cur = self.conn.cursor()
@@ -2862,6 +2907,30 @@ class MainWindow(QMainWindow):
         label_operations.setStyleSheet("font-size: 11pt; color: #0078d4;")
         header_operations_layout.addWidget(label_operations)
         header_operations_layout.addStretch()
+
+        # Le regroupement se déduit du code marché ; certaines codifications
+        # lui échappent et se corrigent ici, une fois pour toutes.
+        self.btn_rattachements = QPushButton("🔗 Rattacher les marchés")
+        self.btn_rattachements.setToolTip(
+            "Dire à quelle opération appartient un marché que la codification\n"
+            "ne permet pas de rattacher (MC157_01 et MC157_02, 2020_14G1 à GO…).\n"
+            "Tant que rien n'est saisi, le regroupement actuel ne change pas."
+        )
+        self.btn_rattachements.clicked.connect(self.rattacher_marches_operations)
+        self.btn_rattachements.setStyleSheet("""
+            QPushButton {
+                background-color: #6f42c1;
+                color: white;
+                border: none;
+                padding: 5px 15px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #5a32a3;
+            }
+        """)
+        header_operations_layout.addWidget(self.btn_rattachements)
 
         operations_layout.addWidget(header_operations)
 
@@ -6109,6 +6178,25 @@ class MainWindow(QMainWindow):
         if dialog.exec_() == QDialog.Accepted:
             # Les enveloppes viennent de changer : les vues qui affichent un
             # solde doivent repartir des nouveaux montants.
+            self.marches_analyzer.invalider_vision()
+            self.refresh_marches_data()
+
+    def rattacher_marches_operations(self):
+        """Ouvre l'arbitrage du rattachement des marchés à leur opération."""
+        if not self.marches_analyzer:
+            QMessageBox.warning(
+                self,
+                "Données non chargées",
+                "Veuillez d'abord charger les données en cliquant sur 'Actualiser les données'."
+            )
+            return
+
+        from operations_dialog import CorrespondanceOperationsDialog
+
+        dialog = CorrespondanceOperationsDialog(self.db, self.marches_analyzer, self)
+        if dialog.exec_() == QDialog.Accepted:
+            # Le regroupement des lots vient de changer : toutes les vues qui
+            # raisonnent par opération repartent des nouveaux rattachements.
             self.marches_analyzer.invalider_vision()
             self.refresh_marches_data()
 

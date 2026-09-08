@@ -577,5 +577,67 @@ class TestDescriptionFiltresActifs(BaseTestFenetre):
         self._cocher(combo, marches[1])
 
 
+class TestBoutonRattachementsSurLaVraieFenetre(BaseTestFenetre):
+    """L'arbitrage des rattachements est atteignable depuis l'onglet Opérations."""
+
+    def test_le_bouton_existe_et_est_branche(self):
+        self.assertIn("Rattacher", self.win.btn_rattachements.text())
+        self.assertTrue(self.win.btn_rattachements.isEnabled())
+
+    def test_le_clic_ouvre_le_dialogue_et_rafraichit(self):
+        import unittest.mock
+
+        from PyQt5.QtWidgets import QDialog
+
+        # L'analyzer réel n'est chargé qu'après « Actualiser les données » :
+        # un jeton suffit, ce qui est éprouvé ici c'est le branchement.
+        class AnalyzerJeton:
+            def __init__(self):
+                self.invalide = 0
+
+            def invalider_vision(self):
+                self.invalide += 1
+
+        jeton = AnalyzerJeton()
+        ouvertures = []
+
+        class DialogueEspion:
+            def __init__(self, db, analyzer, parent=None):
+                ouvertures.append((db, analyzer))
+
+            def exec_(self):
+                return QDialog.Accepted
+
+        import operations_dialog
+        with unittest.mock.patch.object(
+            operations_dialog, "CorrespondanceOperationsDialog", DialogueEspion
+        ), unittest.mock.patch.object(
+            self.win, "marches_analyzer", jeton
+        ), unittest.mock.patch.object(
+            self.win, "refresh_marches_data"
+        ) as rafraichir:
+            self.win.btn_rattachements.click()
+
+        self.assertEqual(len(ouvertures), 1)
+        self.assertIs(ouvertures[0][1], jeton)
+        # Le regroupement a pu changer : la vision mémorisée doit être jetée.
+        self.assertEqual(jeton.invalide, 1)
+        rafraichir.assert_called_once()
+
+    def test_sans_donnees_chargees_le_clic_previent(self):
+        import unittest.mock
+
+        import PyQt5.QtWidgets as W
+
+        avertissements = []
+        with unittest.mock.patch.object(self.win, "marches_analyzer", None), \
+                unittest.mock.patch.object(
+                    W.QMessageBox, "warning",
+                    staticmethod(lambda p, t, m="", *a, **k: avertissements.append(t))):
+            self.win.rattacher_marches_operations()
+
+        self.assertEqual(avertissements, ["Données non chargées"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

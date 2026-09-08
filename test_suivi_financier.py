@@ -1227,5 +1227,111 @@ class TestLibelleSousTotal(unittest.TestCase):
         )
 
 
+class TestRacineCodification(unittest.TestCase):
+    """Rapprochement des codes marchés que la règle sépare à tort."""
+
+    def test_annee_numero_regroupe_les_suffixes(self):
+        from operations_marches import racine_codification
+
+        for code in ("2019_06P1", "2019_06P2", "2019_06P3", "2019_06P3R", "2019_06"):
+            self.assertEqual(racine_codification(code), "2019_06", code)
+
+    def test_annees_et_numeros_distincts_ne_se_melangent_pas(self):
+        from operations_marches import racine_codification
+
+        self.assertEqual(racine_codification("2019_08"), "2019_08")
+        self.assertEqual(racine_codification("2020_14G3P"), "2020_14")
+        self.assertNotEqual(
+            racine_codification("2019_06P1"), racine_codification("2019_08")
+        )
+
+    def test_codes_mc_regroupes_sur_le_premier_segment(self):
+        from operations_marches import racine_codification
+
+        self.assertEqual(racine_codification("MC157_01"), "MC157")
+        self.assertEqual(racine_codification("MC157_02"), "MC157")
+        self.assertEqual(racine_codification("MC152_3_2A"), "MC152")
+        self.assertNotEqual(
+            racine_codification("MC109_1_02"), racine_codification("MC113_1_02")
+        )
+
+    def test_code_vide_ou_absurde(self):
+        from operations_marches import racine_codification
+
+        self.assertEqual(racine_codification(""), "")
+        self.assertEqual(racine_codification(None), "")
+        self.assertEqual(racine_codification("  UGAP2  "), "UGAP2")
+        self.assertEqual(racine_codification("2020_"), "2020")
+
+
+class TestOperationsAArbitrer(unittest.TestCase):
+    """Les souches portant plusieurs opérations, et elles seules."""
+
+    def test_souche_a_operation_unique_ignoree(self):
+        from operations_marches import operations_a_arbitrer
+
+        self.assertEqual(operations_a_arbitrer(["2024_17", "MC146_1", "UGAP2"]), {})
+
+    def test_souche_a_plusieurs_operations_signalee(self):
+        from operations_marches import operations_a_arbitrer
+
+        resultat = operations_a_arbitrer(
+            ["2019_06P1", "2019_06P3R", "2019_08", "MC157_01", "MC157_02"]
+        )
+        self.assertEqual(
+            resultat,
+            {"2019_06": ["2019_06P1", "2019_06P3R"], "MC157": ["MC157_01", "MC157_02"]},
+        )
+
+    def test_doublons_et_vides_ne_creent_pas_d_arbitrage(self):
+        from operations_marches import operations_a_arbitrer
+
+        self.assertEqual(operations_a_arbitrer(["MC157_01", "MC157_01", "", None]), {})
+
+    def test_le_jeu_reel_ne_signale_que_des_cas_plausibles(self):
+        """Sur les exports du dépôt, aucune souche isolée ne doit remonter."""
+        from operations_marches import operations_a_arbitrer
+
+        analyzer = _charger_analyzer()
+        if analyzer is None:
+            self.skipTest("exports SEDIT absents du dépôt")
+
+        operations = {op["operation"] for op in analyzer.get_vision_operations()}
+        souches = operations_a_arbitrer(operations)
+        self.assertTrue(souches)
+        for souche, codes in souches.items():
+            self.assertGreaterEqual(len(codes), 2, souche)
+            for code in codes:
+                self.assertTrue(code.startswith(souche.split("_")[0]), (souche, code))
+
+
+class TestLotIsole(unittest.TestCase):
+    """« 1 lot » quand le code marché en annonce d'autres."""
+
+    def test_lot_unique_facture(self):
+        from operations_marches import lot_isole
+
+        self.assertTrue(lot_isole("2020_24_7", "2020_24", ["2020_24_7"]))
+        self.assertTrue(lot_isole("MC643_1A_01", "MC643_1A", ["MC643_1A_01"]))
+
+    def test_marche_qui_est_son_operation(self):
+        from operations_marches import lot_isole
+
+        self.assertFalse(lot_isole("2020_14G3P", "2020_14G3P", ["2020_14G3P"]))
+
+    def test_operation_a_plusieurs_lots(self):
+        from operations_marches import lot_isole
+
+        self.assertFalse(
+            lot_isole("2024_17_1", "2024_17", ["2024_17_1", "2024_17_2"])
+        )
+
+    def test_codes_sans_rapport(self):
+        from operations_marches import lot_isole
+
+        self.assertFalse(lot_isole("MC157_01", "2020_14", ["MC157_01"]))
+        self.assertFalse(lot_isole("", "2020_24", [""]))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

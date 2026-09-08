@@ -137,7 +137,7 @@ accepte les montants au format français et n'écrit rien si l'un est illisible.
 
 ### Depuis l'interface
 
-Deux boutons couvrent le même besoin sans passer par la ligne de commande :
+Trois boutons couvrent le même besoin sans passer par la ligne de commande :
 
 - **💶 Enveloppes des marchés** (onglet *Suivi des marchés*) ouvre la saisie en
   masse : un marché par ligne, seule la colonne enveloppe est éditable, les
@@ -158,6 +158,9 @@ Deux boutons couvrent le même besoin sans passer par la ligne de commande :
   sans tenir compte du filtre affiché). Cocher les deux options de présentation
   rend exactement le tableau que produisait le bouton en dur — un test le
   vérifie feuille contre feuille.
+
+- **🔗 Rattacher les marchés** (onglet *Opérations*) tranche les regroupements
+  que la codification ne permet pas de lire — voir ci-dessous.
 
 ### Onglet Opérations
 
@@ -190,6 +193,34 @@ l'opération qui le porte.
 
 La colonne **Fournisseur** liste tous les titulaires, cotraitants compris : un
 marché tenu par un groupement n'affichait que son mandataire.
+
+Le **Nb lots** affiche `1 ?` quand l'opération n'est vue que par un lot dont le
+code en annonce d'autres — `2020_24` connu par le seul `2020_24_7`. Un `1` sec
+se lisait « opération à lot unique » ; il faut lire « un seul lot facturé », les
+frères existant peut-être sans écriture dans les exports SEDIT. L'infobulle
+nomme le lot en question. Treize opérations du dépôt sont dans ce cas.
+
+### Rattacher un marché à son opération
+
+L'opération d'un marché se déduit de son code : `extract_operation` retire un
+dernier segment numérique de un ou deux chiffres et y voit un n° de lot, si bien
+que `2024_17_3` rejoint `2024_17`. La règle ne peut rien deviner au-delà :
+`MC157_01` et `MC157_02` deviennent deux opérations, `2019_06P1` à `P3R` quatre,
+`2020_14G1` à `GO` sept. Savoir si `P2` est une phase de `2019_06` ou une
+affaire distincte relève du dossier, pas du programme.
+
+Le bouton **🔗 Rattacher les marchés** ouvre la table de correspondance
+`marché → opération` : un marché par ligne, l'opération déduite par la règle en
+regard, et une seule colonne modifiable — l'opération retenue. Les lignes dont
+le code ressemble à celui d'un voisin sont surlignées ; sur les exports du
+dépôt, sept souches réunissant vingt-deux marchés remontent, sans faux positif.
+Une case « n'afficher que les cas à arbitrer » les isole.
+
+Le comportement par défaut est **exactement l'ancien** : la table est vide, et
+tant que rien n'y est saisi aucun regroupement ne change. Vider une case revient
+à la règle, et « Effacer tous les rattachements » remet tout le tableau à la
+règle. Le rattachement saisi vaut pour l'onglet *Opérations* comme pour l'export
+et la régénération en lot, qui lisent la même table (`operations_marches`).
 
 ### Filtres (Commandes, Rappels, Factures, Facturation)
 
